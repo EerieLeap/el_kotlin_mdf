@@ -134,7 +134,7 @@ class DamagedFilesTest {
         val bytes = file { blocks -> blocks.of("CN", 1).links[1] = blocks.of("CN", 1) }
 
         val failure = assertIs<MdfFailure.Damaged>(failure(bytes))
-        assertTrue(failure.reason.contains("nest"), failure.reason)
+        assertTrue(failure.reason.contains("comes back"), failure.reason)
     }
 
     @Test

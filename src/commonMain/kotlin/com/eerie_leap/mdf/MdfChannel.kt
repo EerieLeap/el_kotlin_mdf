@@ -134,6 +134,8 @@ public class MdfChannel internal constructor(
     public val precision: Int?,
     internal val compositionType: String?,
     internal val signalDataLink: Long,
+    /** The array the channel's composition is, where it is one: then [members] are its elements, if it could lay them out. */
+    public val array: MdfChannelArray? = null,
 ) {
     /** The variable-length data group this channel's values are kept in, for a channel of that kind in an unsorted group. */
     public var signalDataGroup: MdfChannelGroup? = null
@@ -159,9 +161,27 @@ public class MdfChannel internal constructor(
 
     public val isStrictlyMonotonous: Boolean get() = (flags and FLAG_STRICTLY_MONOTONOUS) != 0
 
-    /** Whether this channel's values are numbers a plot can draw: stored in the record, as a number, and not [allValuesInvalid]. */
+    /**
+     * Whether this channel's values are numbers a plot can draw: stored in the record, as a number, and not an array (whose
+     * elements are the channels to draw).
+     */
     public val isNumeric: Boolean
-        get() = dataType.isNumber && (kind == MdfChannelKind.Fixed || kind == MdfChannelKind.Master || isVirtual)
+        get() = dataType.isNumber && array == null && (kind == MdfChannelKind.Fixed || kind == MdfChannelKind.Master || isVirtual)
+
+    /** The channel and the channels inside it (the members of a structure, the elements of an array), depth first. */
+    internal fun withMembers(): List<MdfChannel> = listOf(this) + members.flatMap { it.withMembers() }
+
+    /** The channel with [members] and [array] set: the elements of an array, made from the channel as the loader found it. */
+    internal fun withArray(array: MdfChannelArray, members: List<MdfChannel>): MdfChannel = MdfChannel(
+        offset, name, unit, comment, kind, syncType, dataType, byteOffset, bitOffset, bitCount, flags, invalidationBit, conversion, source,
+        members, valueRange, precision, compositionType, signalDataLink, array,
+    ).also { it.signalDataGroup = signalDataGroup }
+
+    /** One element of the array this channel is, named [name], [byteOffset] bytes into the record, with its invalidation bit. */
+    internal fun element(name: String, byteOffset: Int, invalidationBit: Int?): MdfChannel = MdfChannel(
+        offset, name, unit, comment, kind, MdfSyncType.None, dataType, byteOffset, bitOffset, bitCount, flags, invalidationBit, conversion,
+        source, emptyList(), valueRange, precision, null, 0L, null,
+    )
 
     override fun toString(): String = "MdfChannel($name, $kind, $dataType, byte $byteOffset bit $bitOffset+$bitCount)"
 

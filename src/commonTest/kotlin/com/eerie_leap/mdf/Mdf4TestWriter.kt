@@ -38,6 +38,7 @@ internal object GroupFlags {
     const val VARIABLE_LENGTH = 0x01
     const val BUS_EVENT = 0x02
     const val PLAIN_BUS_EVENT = 0x04
+    const val REMOTE_MASTER = 0x08
 }
 
 /** A block to write: its type, links (to blocks that get their address at layout), and the fields after the links. */
@@ -79,6 +80,10 @@ internal class BlockLayout {
     /** The source information blocks made so far: a source is one block, shared by the groups that name it. */
     val sources = HashMap<SourceSpec, TestBlock>()
 
+    /** The channel group and channel blocks made so far, by the spec they were made from. */
+    val groups = HashMap<GroupSpec, TestBlock>()
+    val channels = HashMap<ChannelSpec, TestBlock>()
+
     fun add(block: TestBlock): TestBlock = block.also { blocks.add(it) }
 
     fun block(type: String, links: Int, data: ByteArray): TestBlock = add(TestBlock(type, links, data))
@@ -117,6 +122,9 @@ internal class BlockLayout {
 
     private fun nextOf(block: TestBlock): TestBlock? = if (block.type in CHAINED) block.links[0] else null
 
+    // A DL lists its data blocks before the next list.
+    private fun dataListOrder(block: TestBlock): List<Int> = (1 until block.links.size).toList() + 0
+
     // GetChildren() of rt_core's blocks, as indices of the links: comment, names, source, conversion, composition, data.
     private fun childOrder(block: TestBlock): List<Int> = when (block.type) {
         "HD" -> listOf(5, 1, 2, 3, 4, 0)
@@ -125,6 +133,11 @@ internal class BlockLayout {
         "CG" -> listOf(5, 2, 3, 4, 1)
         "CN" -> listOf(7, 2, 6, 3, 4, 1, 5)
         "SI", "CC" -> block.links.indices.toList()
+        "DL", "LD" -> dataListOrder(block)
+        "HL", "CA" -> listOf(0)
+        "CH" -> listOf(3, 2, 1)
+        "EV" -> listOf(4, 3, 1, 2)
+        "AT" -> listOf(3, 1, 2)
         else -> emptyList()
     }
 
@@ -154,7 +167,7 @@ internal class BlockLayout {
         const val ALIGNMENT = 8
         const val U32_BYTES = 4
         const val BLOCK_MARK = "##"
-        val CHAINED = setOf("FH", "DG", "CG", "CN")
+        val CHAINED = setOf("FH", "DG", "CG", "CN", "CH", "EV", "AT")
     }
 }
 
@@ -264,6 +277,10 @@ internal class ChannelSpec(
     val source: SourceSpec? = null,
     val signalData: GroupSpec? = null,
     val valueRange: ClosedFloatingPointRange<Double>? = null,
+    /** The array (CA) the channel's composition is; [members] are then ignored. */
+    val array: ArraySpec? = null,
+    /** The signal data (SD) block, list or header the channel keeps its values in, made with the file's layout. */
+    val signalDataBlock: ((BlockLayout) -> TestBlock)? = null,
 )
 
 /** A channel group to write (CG). */
@@ -279,6 +296,10 @@ internal class GroupSpec(
     val source: SourceSpec? = null,
     val vlsdBytes: Long = 0,
     val pathSeparator: Int = 0,
+    /** The group that holds this group's master (cg_cg_master): the flag is set and the link written. */
+    val remoteMaster: GroupSpec? = null,
+    /** The group has a sample reduction block (SR), a block the reader leaves be. */
+    val sampleReductions: Boolean = false,
 )
 
 /** A data group to write (DG) with the bytes of its records. */
@@ -312,8 +333,21 @@ internal class FileSpec(
     val laterTools: List<String> = emptyList(),
     /** Called with the blocks before the file is laid out, to damage them. */
     val tamper: ((List<TestBlock>) -> Unit)? = null,
+    /** Called once the groups are written and before the file is laid out, to add what hangs on the header (CH, AT, EV). */
+    val extras: ((FileBuild) -> Unit)? = null,
 )
 
+/** What a file's header and groups were written as, for the blocks that refer to them. */
+internal class FileBuild(val layout: BlockLayout, val header: TestBlock, val dataGroups: List<TestBlock>, val spec: FileSpec) {
+    /** The block of the data group [group] is in. */
+    fun dataGroupOf(group: GroupSpec): TestBlock = dataGroups[spec.dataGroups.indexOfFirst { group in it.groups }]
+}
+
+private const val CG_LINKS = 6
+private const val CG_LINKS_WITH_MASTER = 7
+private const val CG_SAMPLE_REDUCTION = 4
+private const val CG_MASTER = 6
+private const val SR_FIELDS = 24
 private const val HD_LINKS = 6
 private const val HD_DATA_GROUP = 0
 private const val HD_FILE_HISTORY = 1
@@ -340,6 +374,8 @@ internal fun writeFile(spec: FileSpec): ByteArray {
             ?: layout.block("DT", 0, dataGroup.records).also { dt -> dt.declaredLength = dataGroup.dataBlockLength }
         dg.links[2] = data
     }
+    linkRemoteMasters(layout, spec)
+    spec.extras?.invoke(FileBuild(layout, hd, dataBlocks.map { it.first }, spec))
     layout.arrange(hd)
     spec.tamper?.invoke(layout.all)
     return layout.build(idBlock(spec.finalized, spec.unfinalizedFlags, spec.versionText, spec.version))
@@ -372,8 +408,10 @@ private fun writeGroups(layout: BlockLayout, dg: TestBlock, dataGroup: DataGroup
     val blocks = HashMap<GroupSpec, TestBlock>()
     var previous: TestBlock? = null
     for (group in dataGroup.groups) {
-        val cg = layout.block("CG", 6, groupData(group))
+        val cg = layout.block("CG", if (group.remoteMaster != null) CG_LINKS_WITH_MASTER else CG_LINKS, groupData(group))
         blocks[group] = cg
+        layout.groups[group] = cg
+        if (group.sampleReductions) cg.links[CG_SAMPLE_REDUCTION] = layout.block("SR", 2, ByteArray(SR_FIELDS))
         if (previous == null) dg.links[1] = cg else previous.links[0] = cg
         previous = cg
         group.name?.let { cg.links[2] = layout.text(it) }
@@ -384,12 +422,13 @@ private fun writeGroups(layout: BlockLayout, dg: TestBlock, dataGroup: DataGroup
 }
 
 private fun groupData(group: GroupSpec): ByteArray {
+    val flags = if (group.remoteMaster != null) group.flags or GroupFlags.REMOTE_MASTER else group.flags
     val variable = (group.flags and GroupFlags.VARIABLE_LENGTH) != 0
     val dataBytes = if (variable) group.vlsdBytes and 0xFFFFFFFFL else group.dataBytes.toLong()
     val invalidationBytes = if (variable) group.vlsdBytes ushr 32 else group.invalidationBytes.toLong()
     return ByteWriter().u64(
         group.recordId,
-    ).u64(group.cycleCount).u16(group.flags).u16(group.pathSeparator).zeros(4).u32(dataBytes).u32(invalidationBytes)
+    ).u64(group.cycleCount).u16(flags).u16(group.pathSeparator).zeros(4).u32(dataBytes).u32(invalidationBytes)
         .toByteArray()
 }
 
@@ -400,11 +439,12 @@ private fun writeSource(layout: BlockLayout, source: SourceSpec): TestBlock = la
     si
 }
 
-private fun writeChannels(layout: BlockLayout, channels: List<ChannelSpec>, groups: Map<GroupSpec, TestBlock>): TestBlock? {
+internal fun writeChannels(layout: BlockLayout, channels: List<ChannelSpec>, groups: Map<GroupSpec, TestBlock>): TestBlock? {
     var first: TestBlock? = null
     var previous: TestBlock? = null
     for (channel in channels) {
         val cn = layout.block("CN", 8, channelData(channel))
+        layout.channels[channel] = cn
         if (first == null) first = cn else previous?.links?.set(0, cn)
         previous = cn
         cn.links[2] = layout.text(channel.name)
@@ -413,7 +453,12 @@ private fun writeChannels(layout: BlockLayout, channels: List<ChannelSpec>, grou
         channel.unit?.let { cn.links[6] = layout.text(it) }
         channel.comment?.let { cn.links[7] = layout.xml("<CNcomment><TX>${escapeXml(it)}</TX></CNcomment>") }
         channel.signalData?.let { target -> cn.links[5] = groups[target] ?: error("the signal data group comes first") }
-        if (channel.members.isNotEmpty()) cn.links[1] = writeChannels(layout, channel.members, groups)
+        channel.signalDataBlock?.let { cn.links[5] = it(layout) }
+        if (channel.array != null) {
+            cn.links[1] = writeArray(layout, channel.array, groups)
+        } else if (channel.members.isNotEmpty()) {
+            cn.links[1] = writeChannels(layout, channel.members, groups)
+        }
     }
     return first
 }
@@ -445,4 +490,12 @@ internal fun writeConversion(layout: BlockLayout, spec: ConversionSpec): TestBlo
         }
     }
     return cc
+}
+
+// The groups that name a master in another group link to it once every group has its block.
+private fun linkRemoteMasters(layout: BlockLayout, spec: FileSpec) {
+    for (group in spec.dataGroups.flatMap { it.groups }) {
+        val master = group.remoteMaster ?: continue
+        layout.groups.getValue(group).links[CG_MASTER] = layout.groups.getValue(master)
+    }
 }

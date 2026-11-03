@@ -26,6 +26,9 @@ public class MdfComment internal constructor(
     public companion object {
         public val EMPTY: MdfComment = MdfComment("", emptyMap(), emptyMap())
 
+        /** The text of a plain comment (a TX block): markup in it is text. */
+        internal fun plain(text: String): MdfComment = if (text.isBlank()) EMPTY else MdfComment(text.trim(), emptyMap(), emptyMap())
+
         /** A plain comment, or an MD block's XML, read for its text, properties and elements. Never fails. */
         public fun parse(text: String): MdfComment {
             val start = text.indexOfFirst { !it.isWhitespace() && it.code != BYTE_ORDER_MARK }
@@ -51,6 +54,7 @@ private const val LOW_SURROGATE_BASE = 0xDC00
 private const val LOW_SURROGATE_MASK = 0x3FF
 private const val HEX_RADIX = 16
 private const val DECIMAL_RADIX = 10
+private const val MAX_ENTITY_NAME = 12
 
 private class Frame(val name: String, val attribute: String?) {
     val text = StringBuilder()
@@ -200,7 +204,7 @@ internal fun decode(text: String): String {
     val result = StringBuilder(text.length)
     var i = 0
     while (i < text.length) {
-        val end = if (text[i] == '&') text.indexOf(';', i) else -1
+        val end = if (text[i] == '&') semicolonAfter(text, i) else -1
         val entity = if (end > i) entityValue(text.substring(i + 1, end)) else null
         if (entity == null) {
             result.append(text[i])
@@ -211,6 +215,16 @@ internal fun decode(text: String): String {
         }
     }
     return result.toString()
+}
+
+// The `;` that ends an entity begun by the `&` at [ampersand], looked for only as far as an entity's name goes: a text of nothing
+// but ampersands would otherwise be read to its end at each of them.
+private fun semicolonAfter(text: String, ampersand: Int): Int {
+    val limit = minOf(text.length, ampersand + MAX_ENTITY_NAME + 1)
+    for (at in ampersand + 1 until limit) {
+        if (text[at] == ';') return at
+    }
+    return -1
 }
 
 private fun entityValue(name: String): String? = when (name) {

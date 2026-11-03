@@ -14,7 +14,9 @@ private const val CG_LINK_NEXT = 0
 private const val CG_LINK_CHANNEL = 1
 private const val CG_LINK_NAME = 2
 private const val CG_LINK_SOURCE = 3
+private const val CG_LINK_SAMPLE_REDUCTION = 4
 private const val CG_LINK_COMMENT = 5
+private const val CG_LINK_MASTER = 6
 private const val CG_RECORD_ID = 0
 private const val CG_CYCLE_COUNT = 8
 private const val CG_FLAGS = 16
@@ -48,6 +50,8 @@ private const val MAX_COMPOSITION_DEPTH = 8
 
 /** Reads the data groups of a file, with their channel groups and channels (DG, CG, CN), and what they link to. */
 internal class StructureLoader(private val context: LoaderContext, private val conversions: ConversionLoader) {
+    private val arrays = ArrayLoader(context)
+
     /** The data groups of the chain that begins at [first]; [holder] is the block that links to it. */
     suspend fun dataGroups(first: Long, holder: Long): List<MdfDataGroup> =
         context.chain(first, holder, "DG", "the data groups") { block, index -> dataGroup(block, index) }
@@ -72,6 +76,7 @@ internal class StructureLoader(private val context: LoaderContext, private val c
         val name = context.text(block.link(CG_LINK_NAME), block.offset, "a channel group")
         val subject = "channel group ${name.ifEmpty { "at byte ${block.offset}" }}"
         val channels = channels(block.link(CG_LINK_CHANNEL), block.offset, subject, 0)
+        val hasRemoteMaster = (flags and MdfChannelGroup.FLAG_REMOTE_MASTER) != 0
         val group = MdfChannelGroup(
             offset = block.offset,
             recordId = block.u64(CG_RECORD_ID),
@@ -85,6 +90,8 @@ internal class StructureLoader(private val context: LoaderContext, private val c
             invalidationBytes = if (isVlsd) 0 else invalidationBytes,
             vlsdBytes = if (isVlsd) dataBytes or (invalidationBytes shl Int.SIZE_BITS) else 0,
             channels = channels,
+            remoteMasterLink = if (hasRemoteMaster) block.link(CG_LINK_MASTER) else 0L,
+            hasSampleReductions = block.link(CG_LINK_SAMPLE_REDUCTION) != 0L,
         )
         return group to block.link(CG_LINK_NEXT)
     }
@@ -102,7 +109,7 @@ internal class StructureLoader(private val context: LoaderContext, private val c
         val flags = block.u32AsInt(CN_FLAGS)
         val conversion = conversions.load(block.link(CN_LINK_CONVERSION), block.offset, subject)
         val composition = composition(block, subject, depth)
-        val channel = MdfChannel(
+        val plain = MdfChannel(
             offset = block.offset,
             name = name,
             unit = context.text(block.link(CN_LINK_UNIT), block.offset, subject).ifEmpty { conversion?.info?.unit.orEmpty() },
@@ -114,7 +121,7 @@ internal class StructureLoader(private val context: LoaderContext, private val c
             bitOffset = block.u8(CN_BIT_OFFSET),
             bitCount = nonNegative(block, CN_BIT_COUNT, "bit count"),
             flags = flags,
-            invalidationBit = if ((flags and MdfChannel.FLAG_INVALIDATION_BIT_VALID) != 0) block.u32AsInt(CN_INVALIDATION_BIT) else null,
+            invalidationBit = if ((flags and MdfChannel.FLAG_INVALIDATION_BIT_VALID) != 0) invalidationBit(block) else null,
             conversion = conversion,
             source = context.source(block.link(CN_LINK_SOURCE), block.offset, subject),
             members = composition.members,
@@ -123,7 +130,19 @@ internal class StructureLoader(private val context: LoaderContext, private val c
             compositionType = composition.type,
             signalDataLink = signalDataLink(block, kind),
         )
+        val channel = when {
+            composition.arrayLink != 0L -> arrays.load(composition.arrayLink, block.offset, plain, subject)
+            composition.isUnreadable -> plain.withArray(MdfChannelArray.unreadable("its composition can't be read"), emptyList())
+            else -> plain
+        }
         return channel to block.link(CN_LINK_NEXT)
+    }
+
+    // The position of the invalidation bit among the bits after the record's data: a 32-bit number a channel's record can reach.
+    private fun invalidationBit(block: Block): Int {
+        val bit = block.u32(CN_INVALIDATION_BIT)
+        if (bit > Int.MAX_VALUE) damaged(block.offset, "a channel has an invalidation bit at position $bit")
+        return bit.toInt()
     }
 
     private fun nonNegative(block: Block, field: Int, what: String): Int {
@@ -149,15 +168,20 @@ internal class StructureLoader(private val context: LoaderContext, private val c
         }
     }
 
-    private class Composition(val type: String?, val members: List<MdfChannel>)
+    private class Composition(val type: String?, val members: List<MdfChannel>, val arrayLink: Long = 0L, val isUnreadable: Boolean = false)
 
-    // The channels of a structure; an array (CA) is noted and not read.
+    // The channels of a structure, or the link to the array (CA) the channel is: a channel with a composition that can't be read is
+    // not a plain channel, and isn't read as one.
     private suspend fun composition(block: Block, subject: String, depth: Int): Composition {
         val link = block.link(CN_LINK_COMPOSITION)
         if (link == 0L) return Composition(null, emptyList())
-        return context.tolerate(subject, Composition(null, emptyList())) {
+        return context.tolerate(subject, Composition(null, emptyList(), isUnreadable = true)) {
             val header = context.reader.header(link, block.offset, "CN", "CA")
-            if (header.type == "CN") Composition("CN", channels(link, block.offset, subject, depth + 1)) else Composition("CA", emptyList())
+            if (header.type == "CN") {
+                Composition("CN", channels(link, block.offset, subject, depth + 1))
+            } else {
+                Composition("CA", emptyList(), arrayLink = link)
+            }
         }
     }
 

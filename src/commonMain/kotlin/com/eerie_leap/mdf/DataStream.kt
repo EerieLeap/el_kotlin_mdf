@@ -1,8 +1,8 @@
 package com.eerie_leap.mdf
 
 /**
- * A data group's records as one stream of bytes, wherever the file keeps them: in a data block, in a zipped one, (later) in a list
- * of blocks. Positions are into the stream, not the file.
+ * A run of data as one stream of bytes, wherever the file keeps it: in a data block, a zipped one, a list of them. Positions are
+ * into the stream, not the file. A data group's records are one stream; the variable-length values of a channel are another.
  */
 internal interface DataStream {
     /** Where the stream begins in the file: the first byte of a data block, the block of a zipped one. For a failure to say where. */
@@ -16,83 +16,24 @@ internal interface DataStream {
 
     /** Reads up to [length] bytes from [position] (of the [available] ones) into [into] at [offset]; the number read. */
     suspend fun read(position: Long, into: ByteArray, offset: Int, length: Int): Int
+
+    /** Fails now, as a read would later, where the stream's data can't be decoded (a zipped block that doesn't inflate). */
+    suspend fun verify() {}
 }
 
-// A data block (DT): the file's bytes from [start] to [declaredEnd], or, for the last block of an unfinished file, to the block
-// after it or the file's end, as the file has them now.
-private class FileData(
-    private val source: MdfSource,
-    private val start: Long,
-    private val declaredEnd: Long?,
-    private val nextBlock: Long?,
-) : DataStream {
-    override val origin: Long get() = start
+/** A stream of nothing, for a data group that has no data. */
+internal object EmptyData : DataStream {
+    override val origin: Long get() = 0L
 
-    override val declaredLength: Long? get() = declaredEnd?.let { it - start }
+    override val declaredLength: Long get() = 0L
 
-    override suspend fun available(): Long {
-        val end = minOf(declaredEnd ?: nextBlock ?: Long.MAX_VALUE, source.size)
-        return maxOf(0L, end - start)
-    }
+    override suspend fun available(): Long = 0L
 
-    override suspend fun read(position: Long, into: ByteArray, offset: Int, length: Int): Int {
-        val count = minOf(length.toLong(), available() - position).toInt()
-        return if (count <= 0) 0 else source.read(start + position, into, offset, count)
-    }
+    override suspend fun read(position: Long, into: ByteArray, offset: Int, length: Int): Int = 0
 }
 
-// A zipped data block (DZ): inflated whole once all of it is in the file.
-private class ZippedData(
-    private val reader: BlockReader,
-    private val blockOffset: Long,
-    private val dataOffset: Long,
-    private val zippedLength: Int,
-    private val originalLength: Int,
-    private val transposeColumns: Int,
-) : DataStream {
-    private var inflated: ByteArray? = null
-
-    override val origin: Long get() = blockOffset
-
-    override val declaredLength: Long get() = originalLength.toLong()
-
-    override suspend fun available(): Long = data()?.size?.toLong() ?: 0L
-
-    override suspend fun read(position: Long, into: ByteArray, offset: Int, length: Int): Int {
-        val data = data() ?: return 0
-        val count = minOf(length.toLong(), data.size - position).toInt()
-        if (count <= 0) return 0
-        data.copyInto(into, offset, position.toInt(), position.toInt() + count)
-        return count
-    }
-
-    private suspend fun data(): ByteArray? =
-        inflated ?: if (reader.size < dataOffset + zippedLength) null else load().also { inflated = it }
-
-    private suspend fun load(): ByteArray {
-        val zipped = reader.bytes(dataOffset, zippedLength)
-        val plain = try {
-            inflate(zipped, 0, zipped.size, originalLength)
-        } catch (e: IllegalArgumentException) {
-            damaged(blockOffset, "the zipped data block doesn't inflate: ${e.message}")
-        }
-        return if (transposeColumns > 0) untranspose(plain, transposeColumns) else plain
-    }
-}
-
-// The bytes a transposed block stores column by column, back in records of [columns] bytes; a last record that is incomplete
-// follows as it was.
-private fun untranspose(data: ByteArray, columns: Int): ByteArray {
-    val rows = data.size / columns
-    val result = ByteArray(data.size)
-    for (column in 0 until columns) {
-        for (row in 0 until rows) result[row * columns + column] = data[column * rows + row]
-    }
-    data.copyInto(result, rows * columns, rows * columns, data.size)
-    return result
-}
-
-private object ZippedBlock {
+/** The fields of a zipped data block (DZ) after its header. */
+internal object ZippedBlock {
     /** The most a zipped block may inflate to, or hold zipped: it is inflated whole. */
     const val MAX_BYTES = 64L * 1024 * 1024
     const val FIELDS_SIZE = 24
@@ -105,115 +46,192 @@ private object ZippedBlock {
     const val ZIP_TRANSPOSED = 1
 }
 
-/** Finds where a data group's records are and gives them as a [DataStream]. */
-internal object DataLocator {
-    /**
-     * The records of [group] of [file]. Fails with an [MdfException]: [MdfFailure.Unsupported] for a way of storing the data this
-     * reader doesn't read (yet), [MdfFailure.TooLarge] for a zipped block it won't inflate, [MdfFailure.Damaged] for a data link
-     * that isn't a data block.
-     */
-    suspend fun locate(file: MdfFile, group: MdfDataGroup): DataStream {
-        if (group.dataLink == 0L) return EmptyData
-        // A reader of its own: the pages another read cached, of the file as it was, may be short of what the file holds now.
-        val reader = BlockReader(file.source)
-        val header = reader.header(group.dataLink, group.offset)
-        // The one place that says how a data group's data is stored. A list of data blocks (DL, with its HL header, or the column
-        // storage of MDF 4.2: DV, DI, LD) joins here: a stream of the segments the list names, each a plain or a zipped block, that
-        // reads across them as one, with its last segment open-ended as `plain` makes it for a file not finished.
-        return when (header.type) {
-            "DT" -> plain(file, group, header)
+/** How a zipped block stores its data: [type] (deflate or transposed deflate), [parameter] (the columns), its zipped size. */
+internal class ZipInfo(val type: Int, val parameter: Int, val zippedLength: Long) {
+    /** The record size the data was transposed by, 0 for plain deflate. */
+    val transposeColumns: Int get() = if (type == ZippedBlock.ZIP_TRANSPOSED) parameter else 0
+}
 
-            "DZ" -> zipped(reader, header)
+/**
+ * One block of data in a list (or alone): where its bytes are in the file, how many there are once inflated, and how they are
+ * stored. The data of a plain block (DT, DV, DI, SD) is in the file as it is; a zipped one (DZ) is inflated whole when it is read.
+ */
+internal class DataLeaf(
+    val offset: Long,
+    val dataStart: Long,
+    /** The bytes the block holds once inflated; [OPEN_ENDED] for the last block of an unfinished file, which reaches as far as the file. */
+    val length: Long,
+    val zip: ZipInfo?,
+    /** For an open-ended block, where the next block begins, where one is known. */
+    val limit: Long? = null,
+) {
+    val isOpenEnded: Boolean get() = length == OPEN_ENDED
 
-            else -> throw MdfException(
-                MdfFailure.Unsupported(
-                    header.offset,
-                    "data of block ##${header.type}",
-                    "only data blocks (DT) and zipped ones (DZ) are read",
-                ),
-            )
-        }
+    /** The bytes the block takes in the file after its header: its data as they are, or a zipped block's zipped ones. */
+    val storedLength: Long get() = zip?.zippedLength ?: length
+
+    /** The same block, whose length is not to be believed: its data reach to [limit], or the end of the file. */
+    fun openEnded(limit: Long?): DataLeaf = DataLeaf(offset, dataStart, OPEN_ENDED, zip, limit)
+
+    companion object {
+        const val OPEN_ENDED = -1L
+    }
+}
+
+/**
+ * The data of the blocks of a [Walk] one after the other as one stream. A zipped block is inflated when a read reaches it, and the
+ * last one inflated is kept, so a scan that goes forward inflates each once and holds one. Where the walk was cut short by the end
+ * of a file that is still arriving, [again] walks the lists once more when the file has grown.
+ */
+internal class SegmentedData(private val reader: BlockReader, walk: Walk, private val again: (suspend () -> Walk)? = null) : DataStream {
+    private var leaves: List<DataLeaf> = walk.leaves
+
+    // starts[i] is where leaf i begins in the stream; starts[leaves.size] is the length of the whole, where it is known.
+    private var starts = LongArray(0)
+    private var isOpenEnded = false
+    private var isCut = walk.isCut
+    private var walkedAt = 0L
+
+    // Leaves before this index are known to be wholly in the file; a file only grows, so they stay so.
+    private var settled = 0
+
+    private var inflatedIndex = -1
+    private var inflated: ByteArray? = null
+
+    init {
+        layOut()
     }
 
-    private fun plain(file: MdfFile, group: MdfDataGroup, header: BlockHeader): DataStream {
-        val start = header.contentOffset
-        val isLastBlock = file.groups.maxOf { it.dataLink } == group.dataLink
-        val isStale = !file.identification.isFinalized && (
-            UnfinalizedFlag.LastDataBlockLength in file.identification.unfinalized || header.length <= BlockFormat.HEADER_SIZE
-            )
-        return if (isStale && isLastBlock) {
-            FileData(file.source, start, declaredEnd = null, nextBlock = firstBlockAfter(file.blockOffsets, header.offset))
-        } else {
-            FileData(file.source, start, declaredEnd = header.end, nextBlock = null)
+    private fun layOut() {
+        val size = reader.size
+        starts = LongArray(leaves.size + 1)
+        for ((index, leaf) in leaves.withIndex()) {
+            if (leaf.isOpenEnded) {
+                starts[index + 1] = starts[index]
+                continue
+            }
+            // Only the last block can run past the end of the file (it is being written, or the file was cut); and the data of all
+            // the blocks can't add up to more than a number holds.
+            if (index < leaves.lastIndex && leaf.storedLength > size - leaf.dataStart) {
+                damaged(
+                    leaf.offset,
+                    "the data block at byte ${leaf.offset} claims ${leaf.storedLength} bytes, more than the file holds after it",
+                )
+            }
+            if (leaf.length > Long.MAX_VALUE - starts[index]) damaged(leaf.offset, "the data blocks claim more bytes than any file holds")
+            starts[index + 1] = starts[index] + leaf.length
         }
+        isOpenEnded = leaves.lastOrNull()?.isOpenEnded == true
+        settled = 0
+        inflatedIndex = -1
+        inflated = null
     }
 
-    private suspend fun zipped(reader: BlockReader, header: BlockHeader): DataStream {
-        val fields = reader.bytes(header.contentOffset, ZippedBlock.FIELDS_SIZE)
-        val originalType = fields.decodeToString(ZippedBlock.ORIGINAL_TYPE, ZippedBlock.ORIGINAL_TYPE + 2)
-        if (originalType != "DT") {
-            throw MdfException(
-                MdfFailure.Unsupported(header.offset, "zipped data of ##$originalType", "only zipped data blocks (DT) are read"),
-            )
-        }
-        val zipType = fields.u8(ZippedBlock.ZIP_TYPE)
-        val parameter = fields.u32AsInt(ZippedBlock.PARAMETER)
-        val originalLength = fields.u64(ZippedBlock.ORIGINAL_LENGTH)
-        val zippedLength = fields.u64(ZippedBlock.ZIPPED_LENGTH)
-        val dataOffset = header.contentOffset + ZippedBlock.FIELDS_SIZE
-        checkZipped(header, zipType, parameter, originalLength, zippedLength)
-        return ZippedData(
-            reader,
-            header.offset,
-            dataOffset,
-            zippedLength.toInt(),
-            originalLength.toInt(),
-            if (zipType == ZippedBlock.ZIP_TRANSPOSED) parameter else 0,
-        )
+    override val origin: Long get() = leaves.firstOrNull()?.offset ?: 0L
+
+    override val declaredLength: Long? get() = if (isOpenEnded || isCut) null else starts[leaves.size]
+
+    override suspend fun available(): Long {
+        val size = reader.size
+        if (isCut && again != null && size > walkedAt) walkAgain(again, size)
+        while (settled < leaves.size && isWhollyPresent(leaves[settled], size)) settled++
+        return if (settled == leaves.size) starts[leaves.size] else starts[settled] + presentOf(leaves[settled], size)
     }
 
-    private fun checkZipped(
-        header: BlockHeader,
-        zipType: Int,
-        parameter: Int,
-        originalLength: Long,
-        zippedLength: Long,
-    ) {
-        val tooLarge = maxOf(originalLength, zippedLength)
-        if (tooLarge !in 0..ZippedBlock.MAX_BYTES) throw MdfException(MdfFailure.TooLarge(header.offset, tooLarge, ZippedBlock.MAX_BYTES))
-        if (zipType != ZippedBlock.ZIP_DEFLATE && zipType != ZippedBlock.ZIP_TRANSPOSED) {
-            throw MdfException(
-                MdfFailure.Unsupported(header.offset, "zipped data", "zip type $zipType isn't deflate or transposed deflate"),
-            )
-        }
-        if (zipType == ZippedBlock.ZIP_TRANSPOSED &&
-            parameter <= 0
-        ) {
-            damaged(header.offset, "transposed zipped data with $parameter columns")
-        }
-        if (header.contentOffset + ZippedBlock.FIELDS_SIZE + zippedLength > header.end) {
-            damaged(header.offset, "the zipped data block claims $zippedLength bytes of data but holds fewer")
-        }
+    // The lists were cut short by the end of the file, which has grown: what they name now is walked again.
+    private suspend fun walkAgain(walk: suspend () -> Walk, size: Long) {
+        walkedAt = size
+        val found = walk()
+        leaves = found.leaves
+        isCut = found.isCut
+        layOut()
     }
 
-    // The offset of the first block that begins after [offset], null where none does. [blocks] is sorted.
-    private fun firstBlockAfter(blocks: LongArray, offset: Long): Long? {
+    override suspend fun verify() {
+        val first = leaves.firstOrNull() ?: return
+        if (first.zip != null && isWhollyPresent(first, reader.size)) inflatedBytes(0)
+    }
+
+    override suspend fun read(position: Long, into: ByteArray, offset: Int, length: Int): Int {
+        var done = 0
+        var count = 1
+        while (done < length && count > 0) {
+            val at = position + done
+            val index = leafAt(at)
+            count = if (index < 0) 0 else readLeaf(index, at - starts[index], into, offset + done, length - done)
+            done += count
+        }
+        return done
+    }
+
+    // The leaf the stream's byte [at] is in: the last one that begins at or before it; -1 for none, and for a place past the end.
+    private fun leafAt(at: Long): Int {
+        if (at < 0 || leaves.isEmpty()) return -1
+        if (!isOpenEnded && at >= starts[leaves.size]) return -1
         var low = 0
-        var high = blocks.size
+        var high = leaves.size
         while (low < high) {
             val middle = (low + high) ushr 1
-            if (blocks[middle] <= offset) low = middle + 1 else high = middle
+            if (starts[middle] <= at) low = middle + 1 else high = middle
         }
-        return blocks.getOrNull(low)
+        return low - 1
     }
 
-    private object EmptyData : DataStream {
-        override val origin: Long get() = 0L
-
-        override val declaredLength: Long get() = 0L
-
-        override suspend fun available(): Long = 0L
-
-        override suspend fun read(position: Long, into: ByteArray, offset: Int, length: Int): Int = 0
+    private suspend fun readLeaf(
+        index: Int,
+        local: Long,
+        into: ByteArray,
+        offset: Int,
+        length: Int,
+    ): Int {
+        val leaf = leaves[index]
+        if (leaf.zip != null) {
+            val data = inflatedBytes(index) ?: return 0
+            val count = minOf(length.toLong(), data.size - local).toInt()
+            if (count <= 0) return 0
+            data.copyInto(into, offset, local.toInt(), local.toInt() + count)
+            return count
+        }
+        val count = minOf(length.toLong(), presentOf(leaf, reader.size) - local).toInt()
+        return if (count <= 0) 0 else reader.readInto(leaf.dataStart + local, into, offset, count)
     }
+
+    // Whether all of the leaf's bytes are in the file now; a block with no length is never wholly there.
+    private fun isWhollyPresent(leaf: DataLeaf, size: Long): Boolean = !leaf.isOpenEnded && leaf.storedLength <= size - leaf.dataStart
+
+    // How many bytes of the leaf's data can be read now: a zipped block gives none until all of it is there to inflate.
+    private fun presentOf(leaf: DataLeaf, size: Long): Long = when {
+        leaf.zip != null -> if (isWhollyPresent(leaf, size)) leaf.length else 0L
+        leaf.isOpenEnded -> maxOf(0L, minOf(leaf.limit ?: Long.MAX_VALUE, size) - leaf.dataStart)
+        else -> maxOf(0L, minOf(leaf.length, size - leaf.dataStart))
+    }
+
+    private suspend fun inflatedBytes(index: Int): ByteArray? {
+        if (index == inflatedIndex) return inflated
+        val leaf = leaves[index]
+        val zip = leaf.zip ?: return null
+        if (!isWhollyPresent(leaf, reader.size)) return null
+        val zipped = reader.bytes(leaf.dataStart, zip.zippedLength.toInt())
+        val plain = try {
+            inflate(zipped, 0, zipped.size, leaf.length.toInt())
+        } catch (e: IllegalArgumentException) {
+            damaged(leaf.offset, "the zipped data block doesn't inflate: ${e.message}")
+        }
+        val bytes = if (zip.transposeColumns > 0) untranspose(plain, zip.transposeColumns) else plain
+        inflatedIndex = index
+        inflated = bytes
+        return bytes
+    }
+}
+
+// The bytes a transposed block stores column by column, back in records of [columns] bytes; a last record that is incomplete
+// follows as it was.
+internal fun untranspose(data: ByteArray, columns: Int): ByteArray {
+    val rows = data.size / columns
+    val result = ByteArray(data.size)
+    for (column in 0 until columns) {
+        for (row in 0 until rows) result[row * columns + column] = data[column * rows + row]
+    }
+    data.copyInto(result, rows * columns, rows * columns, data.size)
+    return result
 }

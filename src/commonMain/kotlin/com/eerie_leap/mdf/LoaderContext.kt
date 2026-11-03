@@ -19,10 +19,17 @@ private const val SOURCE_FIELDS_SIZE = 3
 internal class LoaderContext(val reader: BlockReader, val lenient: Boolean) {
     val issues = ArrayList<MdfIssue>()
 
+    /** What the file has that the reader doesn't read, whether it is lenient or not: the rest of the file reads. */
+    val skipped = ArrayList<MdfIssue>()
+
     private class RawText(val isXml: Boolean, val text: String)
 
     private val rawTexts = HashMap<Long, RawText>()
     private val sources = HashMap<Long, MdfSourceInformation>()
+
+    // The blocks of each chained type read so far: a block of a chain belongs to one chain only, so one reached twice is damage, and
+    // a structure that names a block over and over can't make the reader read it over and over.
+    private val chained = HashMap<String, HashSet<Long>>()
 
     /** Runs [load]; where it fails and the reader is lenient, notes the failure under [subject] and returns [fallback]. */
     suspend fun <T> tolerate(subject: String, fallback: T, load: suspend () -> T): T = try {
@@ -42,10 +49,13 @@ internal class LoaderContext(val reader: BlockReader, val lenient: Boolean) {
         }
     }
 
-    /** The comment at [link]: plain text from a TX block, XML read from an MD block. */
+    /** The comment at [link]: plain text from a TX block (which may hold anything, markup among it), XML read from an MD block. */
     suspend fun comment(link: Long, holder: Long, subject: String): MdfComment {
         if (link == 0L) return MdfComment.EMPTY
-        return tolerate(subject, MdfComment.EMPTY) { MdfComment.parse(rawText(link, holder).text) }
+        return tolerate(subject, MdfComment.EMPTY) {
+            val raw = rawText(link, holder)
+            if (raw.isXml) MdfComment.parse(raw.text) else MdfComment.plain(raw.text)
+        }
     }
 
     /** The source information at [link], null for no link. */
@@ -67,29 +77,47 @@ internal class LoaderContext(val reader: BlockReader, val lenient: Boolean) {
     }
 
     // The blocks of a chain, each linking to the next: loops and blocks of another type are damage, noted or failed by the context.
+    // A chain of more than [limit] blocks is read to that many and the rest noted as skipped. [load] reads a block; the default reads
+    // it whole.
     suspend fun <T> chain(
         first: Long,
         holder: Long,
         type: String,
         subject: String,
+        limit: Int = Int.MAX_VALUE,
+        load: (suspend (Long, Long) -> Block)? = null,
         read: suspend (Block, Int) -> Pair<T, Long>,
     ): List<T> {
         val items = ArrayList<T>()
-        val visited = HashSet<Long>()
+        val visited = chained.getOrPut(type) { HashSet() }
+        val loadBlock: suspend (Long, Long) -> Block = load ?: { target, source -> reader.block(target, source, type) }
         var link = first
         var from = holder
-        while (link != 0L) {
+        while (link != 0L && items.size < limit) {
             val current = link
             val holderOfCurrent = from
             val next: Long? = tolerate(subject, null) {
-                if (!visited.add(current)) damaged(current, "the chain of ##$type blocks comes back to byte $current")
-                val (item, following) = read(reader.block(current, holderOfCurrent, type), items.size)
+                if (!visited.add(
+                        current,
+                    )
+                ) {
+                    damaged(current, "the chain of ##$type blocks comes back to byte $current, which one chain read already")
+                }
+                val (item, following) = read(loadBlock(current, holderOfCurrent), items.size)
                 items.add(item)
                 following
             }
-            if (next == null) break
-            from = current
-            link = next
+            if (next == null) {
+                link = 0L
+            } else {
+                from = current
+                link = next
+            }
+        }
+        if (link !=
+            0L
+        ) {
+            skipped.add(MdfIssue(MdfFailure.Unsupported(link, "##$type blocks", "the chain has more than $limit of them"), subject))
         }
         return items
     }

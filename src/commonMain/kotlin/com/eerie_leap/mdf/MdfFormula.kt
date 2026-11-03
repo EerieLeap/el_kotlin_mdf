@@ -26,6 +26,9 @@ internal class MdfFormula private constructor(private val root: Node) {
     companion object {
         private const val MAX_DEPTH = 64
 
+        // A chain of operators is a tree as deep as it is long, evaluated by recursion: it is held to a length no formula has.
+        private const val MAX_OPERATORS = 512
+
         private val FUNCTIONS: Map<String, (Double) -> Double> = mapOf(
             "sin" to { v -> sin(v) },
             "cos" to { v -> cos(v) },
@@ -51,6 +54,7 @@ internal class MdfFormula private constructor(private val root: Node) {
     private class FormulaParser(private val text: String) {
         private var pos = 0
         private var depth = 0
+        private var operators = 0
 
         fun parse(): Node {
             val node = expression()
@@ -76,6 +80,7 @@ internal class MdfFormula private constructor(private val root: Node) {
                 val operator = peek()
                 if (operator != '+' && operator != '-') return left
                 pos++
+                countOperator()
                 val right = term()
                 val l = left
                 left =
@@ -95,6 +100,7 @@ internal class MdfFormula private constructor(private val root: Node) {
                 val operator = peek()
                 if (operator != '*' && operator != '/') return left
                 pos++
+                countOperator()
                 val right = unary()
                 val l = left
                 left =
@@ -106,6 +112,10 @@ internal class MdfFormula private constructor(private val root: Node) {
                         Node { x -> l.evaluate(x) / right.evaluate(x) }
                     }
             }
+        }
+
+        private fun countOperator() {
+            if (++operators > MAX_OPERATORS) fail("the formula has more than $MAX_OPERATORS operators")
         }
 
         private fun unary(): Node {

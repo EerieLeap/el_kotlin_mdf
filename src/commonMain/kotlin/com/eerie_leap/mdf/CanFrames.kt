@@ -45,14 +45,29 @@ public class MdfCanFrame(
 
 /**
  * Where the parts of a CAN frame are in a `CAN_DataFrame` group's records, found by the names of its channels: the identifier and
- * the offset to the payload, which it needs, and the [optional] parts a writer may leave out.
+ * the payload, which it needs, and the [optional] parts a writer may leave out. The payload is a variable-length value of another
+ * channel group ([payloads]) or of signal data blocks ([payloadChannel]'s link), or bytes in the record itself ([inline]).
  */
 internal class CanFrameLayout private constructor(
-    val payloads: MdfChannelGroup,
+    /** The variable-length group the payloads are in; null where they are in signal data blocks or in the record. */
+    val payloads: MdfChannelGroup?,
+    /** The `DataBytes` channel. */
+    val payloadChannel: MdfChannel,
     private val identifier: NumberField,
+    /** The offset to the payload in the variable-length data; unused for a payload in the record. */
     val dataBytes: NumberField,
     private val optional: Map<String, NumberField>,
+    private val inline: Boolean,
 ) {
+    /** The payload is bytes in the record, not in variable-length data. */
+    val hasInlinePayload: Boolean get() = inline
+
+    /** The payload bytes of the record whose data begins at [at] in [record], for a layout that [hasInlinePayload]. */
+    fun inlinePayload(record: ByteArray, at: Int): ByteArray {
+        val start = at + payloadChannel.byteOffset
+        return record.copyOfRange(start, start + payloadChannel.byteSpan.toInt())
+    }
+
     /** The frame whose fields are in the record data that begins at [at] in [record], with [payload] as its data. */
     fun frame(record: ByteArray, at: Int, time: Double, payload: ByteArray): MdfCanFrame {
         val rawId = identifier.readBits(record, at)
@@ -90,14 +105,13 @@ internal class CanFrameLayout private constructor(
             val members = frame?.members.orEmpty().associateBy { it.name.substringAfterLast('.') }
             if (!group.isBusEvent || !membersFit(group, members.values)) return null
             val identifier = members["ID"]?.let { NumberField.of(it) }
-            val dataBytes = members["DataBytes"]?.let { NumberField.offsetOf(it) }
-            val payloads = members["DataBytes"]?.signalDataGroup
+            val payload = members["DataBytes"]
+            if (identifier == null || payload == null) return null
+            val inline = payload.kind == MdfChannelKind.Fixed && payload.dataType == MdfDataType.ByteArray && payload.signalDataLink == 0L
+            val variable = payload.signalDataGroup != null || payload.signalDataLink != 0L
+            if (!inline && !variable) return null
             val optional = OPTIONAL_MEMBERS.mapNotNull { name -> members[name]?.let { NumberField.of(it) }?.let { name to it } }.toMap()
-            return if (identifier != null && dataBytes != null && payloads != null) {
-                CanFrameLayout(payloads, identifier, dataBytes, optional)
-            } else {
-                null
-            }
+            return CanFrameLayout(payload.signalDataGroup, payload, identifier, NumberField.offsetOf(payload), optional, inline)
         }
     }
 }

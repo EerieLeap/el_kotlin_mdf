@@ -30,7 +30,14 @@ private val BLOCK_MARK = "##".encodeToByteArray()
 internal fun damaged(offset: Long, reason: String): Nothing = throw MdfException(MdfFailure.Damaged(offset, reason))
 
 /** A block read whole: its [type] (`CN` for `##CN`), its [bytes] from the header on, and how many links it has. */
-internal class Block(val offset: Long, val type: String, val bytes: ByteArray, val linkCount: Int) {
+internal class Block(
+    val offset: Long,
+    val type: String,
+    val bytes: ByteArray,
+    val linkCount: Int,
+    /** The length the block's header claims; more than the bytes held, for a block read in part. */
+    val length: Long = bytes.size.toLong(),
+) {
     /** Where the block's own fields begin, after the header and the links. */
     val dataStart: Int = BlockFormat.HEADER_SIZE + linkCount * BlockFormat.LINK_SIZE
 
@@ -80,7 +87,10 @@ internal class BlockReader(private val source: MdfSource) {
     private var blockOffsets = LongArray(INITIAL_OFFSETS)
     private var blockCount = 0
 
-    val size: Long get() = source.size
+    // The file's size as last read: a file only grows, so a size is read again only when a request reaches past the one known.
+    private var knownSize = 0L
+
+    val size: Long get() = source.size.also { knownSize = it }
 
     /** The offset of every block read so far, in order, for finding where the block after another one begins. */
     fun readBlockOffsets(): LongArray = blockOffsets.copyOf(blockCount).also { it.sort() }
@@ -88,7 +98,7 @@ internal class BlockReader(private val source: MdfSource) {
     /** [length] bytes at [position]. Fails as [MdfFailure.Truncated] where the file has fewer. */
     suspend fun bytes(position: Long, length: Int): ByteArray {
         val end = position + length
-        if (position < 0 || end > source.size) throw MdfException(MdfFailure.Truncated(position, end))
+        if (position < 0 || end > sizeReaching(end)) throw MdfException(MdfFailure.Truncated(position, end))
         val result = ByteArray(length)
         if (length >= PAGE_SIZE) {
             if (readFully(position, result, length) < length) throw MdfException(MdfFailure.Truncated(position, end))
@@ -96,6 +106,16 @@ internal class BlockReader(private val source: MdfSource) {
             copyThroughPages(position, result)
         }
         return result
+    }
+
+    /**
+     * Up to [length] bytes at [position], read from the source as they are and not through the cached pages: for the headers of data
+     * blocks, which are many and far apart. Fewer come back only at the end of the file.
+     */
+    suspend fun directBytes(position: Long, length: Int): ByteArray {
+        val buffer = ByteArray(length)
+        val count = readFully(position, buffer, length)
+        return if (count == length) buffer else buffer.copyOf(count)
     }
 
     /**
@@ -108,8 +128,20 @@ internal class BlockReader(private val source: MdfSource) {
         if (header.length > BlockFormat.MAX_METADATA_BLOCK_BYTES) {
             throw MdfException(MdfFailure.TooLarge(target, header.length, BlockFormat.MAX_METADATA_BLOCK_BYTES))
         }
-        if (header.end > source.size) throw MdfException(MdfFailure.Truncated(target, header.end))
+        if (header.end > sizeReaching(header.end)) throw MdfException(MdfFailure.Truncated(target, header.end))
         return Block(target, header.type, bytes(target, header.length.toInt()), header.linkCount)
+    }
+
+    /**
+     * The block at [target] (of the [expected] types) with its links and the first [fieldBytes] of its fields only, for a block that
+     * ends in data too large to read with it (an attachment). Fails as truncated where the file ends inside what is read.
+     */
+    suspend fun blockStart(target: Long, holder: Long, fieldBytes: Int, vararg expected: String): Block {
+        val header = header(target, holder, *expected)
+        val wanted = BlockFormat.HEADER_SIZE + header.linkCount * BlockFormat.LINK_SIZE + fieldBytes
+        val length = minOf(header.length, wanted.toLong()).toInt()
+        if (target + length > sizeReaching(target + length)) throw MdfException(MdfFailure.Truncated(target, target + length))
+        return Block(target, header.type, bytes(target, length), header.linkCount, header.length)
     }
 
     /**
@@ -117,18 +149,37 @@ internal class BlockReader(private val source: MdfSource) {
      * [block] but for the block running past the file's end, which a data block of a file still arriving does.
      */
     suspend fun header(target: Long, holder: Long, vararg expected: String): BlockHeader {
-        val fileSize = source.size
+        checkLink(target, holder)
+        return headerFrom(bytes(target, BlockFormat.HEADER_SIZE), target, holder, expected)
+    }
+
+    /**
+     * The header of the data block at [target], read directly, and the [extra] bytes that follow it (fewer at the end of the file):
+     * for a block among many, whose header is all a list of them needs, so that no page of data is read to find it.
+     */
+    suspend fun dataHeader(target: Long, holder: Long, extra: Int): Pair<BlockHeader, ByteArray> {
+        checkLink(target, holder)
+        val raw = directBytes(target, BlockFormat.HEADER_SIZE + extra)
+        if (raw.size < BlockFormat.HEADER_SIZE) throw MdfException(MdfFailure.Truncated(target, target + BlockFormat.HEADER_SIZE))
+        val header = headerFrom(raw, target, holder, emptyArray())
+        return header to raw.copyOfRange(BlockFormat.HEADER_SIZE, raw.size)
+    }
+
+    private fun checkLink(target: Long, holder: Long) {
+        val fileSize = sizeReaching(target + BlockFormat.HEADER_SIZE)
         if (isImpossibleLink(target, fileSize)) damaged(holder, "the block at byte $holder links to byte $target, where no block can be")
         if (target + BlockFormat.HEADER_SIZE > fileSize) {
             throw MdfException(MdfFailure.Truncated(target, target + BlockFormat.HEADER_SIZE))
         }
-        val header = bytes(target, BlockFormat.HEADER_SIZE)
-        val type = typeOf(header, target)
+    }
+
+    private fun headerFrom(raw: ByteArray, target: Long, holder: Long, expected: Array<out String>): BlockHeader {
+        val type = typeOf(raw, target)
         if (expected.isNotEmpty() && type !in expected) {
             damaged(target, "the block at byte $holder links to ##${expected.joinToString("/")} but byte $target begins ##$type")
         }
-        val length = header.u64(BlockFormat.LENGTH_AT)
-        val linkCount = header.u64(BlockFormat.LINK_COUNT_AT)
+        val length = raw.u64(BlockFormat.LENGTH_AT)
+        val linkCount = raw.u64(BlockFormat.LINK_COUNT_AT)
         val linkSpace = (length - BlockFormat.HEADER_SIZE) / BlockFormat.LINK_SIZE
         if (length < BlockFormat.HEADER_SIZE || linkCount < 0 || linkCount > linkSpace) {
             damaged(target, "block ##$type claims a length of $length bytes and $linkCount links")
@@ -136,6 +187,12 @@ internal class BlockReader(private val source: MdfSource) {
         if (blockCount == blockOffsets.size) blockOffsets = blockOffsets.copyOf(blockCount * 2)
         blockOffsets[blockCount++] = target
         return BlockHeader(target, type, length, linkCount.toInt())
+    }
+
+    // The file's size, read from the source only if [needed] is past the size known (the file may have grown since).
+    private fun sizeReaching(needed: Long): Long {
+        if (needed > knownSize) knownSize = source.size
+        return knownSize
     }
 
     // A link into the identification block is damage, and so is one past the end of the file where no block could be: a negative or
@@ -182,13 +239,16 @@ internal class BlockReader(private val source: MdfSource) {
         return slot
     }
 
-    private suspend fun readFully(position: Long, into: ByteArray, length: Int): Int {
+    /** Reads up to [length] bytes at [position] into [into] at [offset], from the source as they are; fewer only at the end of the file. */
+    suspend fun readInto(position: Long, into: ByteArray, offset: Int, length: Int): Int {
         var total = 0
-        while (total < length) {
-            val count = source.read(position + total, into, total, length - total)
-            if (count <= 0) break
-            total += count
+        var count = 1
+        while (total < length && count > 0) {
+            count = source.read(position + total, into, offset + total, length - total)
+            if (count > 0) total += count
         }
         return total
     }
+
+    private suspend fun readFully(position: Long, into: ByteArray, length: Int): Int = readInto(position, into, 0, length)
 }

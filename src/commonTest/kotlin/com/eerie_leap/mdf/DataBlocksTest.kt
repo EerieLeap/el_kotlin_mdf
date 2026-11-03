@@ -153,24 +153,12 @@ class DataBlocksTest {
     }
 
     @Test
-    fun saysWhichDataItDoesntReadYet() {
+    fun saysZippedDataOfSomethingElseThanRecordsOrOfAZipTypeItDoesNotKnowIsUnsupported() {
         for (originalType in listOf("SD", "RD")) {
             val failure = assertIs<MdfFailure.Unsupported>(failureOf { scanned(zipped(records(2), originalType = originalType)) })
             assertTrue(failure.what.contains(originalType), failure.what)
         }
         assertIs<MdfFailure.Unsupported>(failureOf { scanned(zipped(records(2), zipType = 7)) })
-
-        // A list of data blocks: for the next version of the reader.
-        val list = writeFile(
-            FileSpec(
-                listOf(
-                    DataGroupSpec(1, listOf(group()), ByteArray(0), dataBlock = { layout -> layout.block("DL", 1, ByteArray(24)) }),
-                ),
-            ),
-        )
-        val failure = assertIs<MdfFailure.Unsupported>(failureOf { scanned(list) })
-        assertTrue(failure.what.contains("##DL"), failure.what)
-        assertTrue(failure.reason.isNotEmpty())
     }
 
     @Test

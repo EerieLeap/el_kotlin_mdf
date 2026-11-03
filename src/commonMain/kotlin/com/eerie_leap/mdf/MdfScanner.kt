@@ -84,6 +84,7 @@ public class MdfScanner private constructor(
      */
     public suspend fun advance(maxBytes: Long = Long.MAX_VALUE): MdfScanProgress {
         stalled = false
+        processor.retry()
         val available = try {
             readAvailable(maxBytes)
         } catch (e: MdfException) {
@@ -97,18 +98,34 @@ public class MdfScanner private constructor(
     private suspend fun readAvailable(maxBytes: Long): Long {
         var consumedHere = 0L
         var available = stream.available()
-        while (!isStopped && consumedHere < maxBytes && position < available) {
+        var more = !isStopped
+        while (more && consumedHere < maxBytes && position < available) {
             fitBuffer(available - position)
             val wanted = minOf(buffer.size.toLong(), available - position).toInt()
             val read = stream.read(position, buffer, 0, wanted)
             val stopAt = minOf(maxBytes - consumedHere, Int.MAX_VALUE.toLong()).toInt()
-            val consumed = if (read > 0) processor.process(buffer, read, position, stopAt) else 0
-            position += consumed
+            val consumed = if (read > 0) takeRecords(read, stopAt) else 0
             consumedHere += consumed
-            if (consumed == 0 && !isStopped && !makeRoom(read)) break
+            // A record waiting for data that isn't in the file yet ends the pass; one that had no room in the buffer grows it.
+            more = !processor.isWaiting && !isStopped && (consumed > 0 || makeRoom(read))
             available = stream.available()
         }
         return stream.available()
+    }
+
+    // Takes the records of the buffer's first [read] bytes, running the reads that a record asks for first and going on in the same
+    // buffer; the bytes taken.
+    private suspend fun takeRecords(read: Int, stopAt: Int): Int {
+        var at = 0
+        var fetch: Fetch?
+        do {
+            at = processor.process(buffer, at, read, position, stopAt)
+            fetch = processor.pendingFetch
+            processor.pendingFetch = null
+            fetch?.run()
+        } while (fetch != null)
+        position += at
+        return at
     }
 
     private val isStopped: Boolean get() = processor.problem != null || processor.finished
@@ -143,7 +160,7 @@ public class MdfScanner private constructor(
             position,
             available,
             declared,
-            isComplete = processor.problem == null && reachedEnd,
+            isComplete = processor.problem == null && reachedEnd && !processor.isWaiting,
             problem = processor.problem,
         )
     }
@@ -163,11 +180,22 @@ public class MdfScanner private constructor(
             channels: List<MdfChannelRequest>,
             sink: MdfSampleSink,
             canGroups: List<MdfChannelGroup> = emptyList(),
+        ): MdfScanner = build(file, dataGroup, channels, sink, canGroups)
+
+        // [depth] counts the scans of masters that this one is the scan of.
+        internal suspend fun build(
+            file: MdfFile,
+            dataGroup: MdfDataGroup,
+            channels: List<MdfChannelRequest>,
+            sink: MdfSampleSink,
+            canGroups: List<MdfChannelGroup> = emptyList(),
+            depth: Int = 0,
         ): MdfScanner {
-            val planned = ScanPlanner(dataGroup).plan(channels, canGroups)
+            val prepared = ScanPreparer(file, dataGroup, depth).prepare(channels, canGroups)
+            val planned = ScanPlanner(dataGroup, prepared, file.isStale(UnfinalizedFlag.VlsdOffsets)).plan(channels, canGroups)
             val stream = DataLocator.locate(file, dataGroup)
             // A zipped block that is all there is inflated now, so a damaged one fails here, not in the middle of a scan.
-            stream.available()
+            stream.verify()
             val countsAreTrue = file.identification.isFinalized || UnfinalizedFlag.CycleCounts !in file.identification.unfinalized
             val single = planned.groups.singleOrNull()
             val limit = if (dataGroup.isSorted && countsAreTrue) single?.group?.cycleCount else null

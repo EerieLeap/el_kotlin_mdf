@@ -68,6 +68,10 @@ public class MdfChannelGroup internal constructor(
     /** For a variable-length group, the total bytes of its values the file says there are (stale in an unfinished file). */
     public val vlsdBytes: Long,
     public val channels: List<MdfChannel>,
+    /** The link to the channel group that holds the group's master (`cg_cg_master`), 0 for none. */
+    internal val remoteMasterLink: Long = 0L,
+    /** The group has sample reductions (SR), which this reader doesn't read: the reader makes its own summaries. */
+    public val hasSampleReductions: Boolean = false,
 ) {
     /** The group holds the values of variable-length channels of other groups (strings, byte arrays, CAN payloads), not records. */
     public val isVlsd: Boolean get() = (flags and FLAG_VLSD) != 0
@@ -81,9 +85,24 @@ public class MdfChannelGroup internal constructor(
     /** The group's master is a channel of another group. */
     public val hasRemoteMaster: Boolean get() = (flags and FLAG_REMOTE_MASTER) != 0
 
-    /** The channel the others are plotted against: the first master, else the first virtual master, else none. */
-    public val master: MdfChannel? =
+    /** The channel group that holds the master of a group that [hasRemoteMaster], once the file's structure has been read. */
+    public var remoteMaster: MdfChannelGroup? = null
+        internal set
+
+    private val ownMaster: MdfChannel? =
         channels.firstOrNull { it.kind == MdfChannelKind.Master } ?: channels.firstOrNull { it.kind == MdfChannelKind.VirtualMaster }
+
+    /**
+     * The channel the others are plotted against: the first master, else the first virtual master, else none; for a group whose
+     * master is in another channel group ([remoteMaster]), that group's.
+     */
+    public val master: MdfChannel? get() = if (hasRemoteMaster) remoteMaster?.ownMaster ?: ownMaster else ownMaster
+
+    /** What the master counts, and so what the time of the group's samples is: time, angle, distance or an index. */
+    public val masterAxis: MdfSyncType get() = master?.syncType ?: MdfSyncType.None
+
+    /** Every channel of the group, the members of structures and the elements of arrays among them, depth first. */
+    public val allChannels: List<MdfChannel> by lazy(LazyThreadSafetyMode.PUBLICATION) { channels.flatMap { it.withMembers() } }
 
     /** The bytes of one of the group's records, apart from its record ID; for a variable-length group, 0. */
     public val recordBytes: Long get() = dataBytes + invalidationBytes

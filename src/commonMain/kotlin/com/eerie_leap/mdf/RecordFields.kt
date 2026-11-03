@@ -58,32 +58,70 @@ internal class NumberField(
     }
 }
 
-/** The bytes of a variable-length group's values (strings, CAN payloads), held until the record that names one asks for it. */
-internal class VariableLengthStore {
-    private val payloads = LinkedHashMap<Long, ByteArray>()
+/**
+ * The bytes of a variable-length group's values (strings, CAN payloads), held until the records that name them have asked for them.
+ * Each value is handed to every reader that asks for its place (a channel requested twice, a channel and the CAN frames that join it)
+ * and let go of after the last. A reader names a value by its offset into the group's data, or, where the file's offsets are stale
+ * ([recount]), by its place in the order the values come: the n-th record of the reader takes the n-th value.
+ */
+internal class VariableLengthStore(private val recount: Boolean = false) {
+    private class Entry(val bytes: ByteArray) {
+        // The readers (by the low bits of their number) that took the value.
+        var takenBy = 0L
+    }
+
+    private val entries = LinkedHashMap<Long, Entry>()
     private var storedBytes = 0L
+    private var count = 0L
+    private val cursors = ArrayList<Long>()
 
     /** The offset the next value is stored at: the bytes of the values before it, each with its 4-byte length. */
     var nextOffset = 0L
         private set
 
-    fun add(value: ByteArray) {
-        payloads[nextOffset] = value
+    /** A reader's number: it is given to [keyFor] and [take]. Every reader registers before the first value is added. */
+    fun register(): Int {
+        cursors.add(0L)
+        return cursors.size - 1
+    }
+
+    /** The key under which a reader finds the value its record names at [offset]: the offset, or its next place in order. */
+    fun keyFor(reader: Int, offset: Long): Long = if (recount) cursors[reader].also { cursors[reader] = it + 1 } else offset
+
+    /** Stores a value and returns its key: the offset it is at, or its place in order. */
+    fun add(value: ByteArray): Long {
+        val key = if (recount) count else nextOffset
+        entries[key] = Entry(value)
+        count++
         nextOffset += U32_SIZE + value.size
         storedBytes += value.size
         // A value nothing ever asks for would pile up: past the limit the oldest go.
-        while (storedBytes > MAX_STORED_BYTES && payloads.isNotEmpty()) {
-            val oldest = payloads.entries.iterator().next()
-            payloads.remove(oldest.key)
-            storedBytes -= oldest.value.size
+        while (storedBytes > MAX_STORED_BYTES && entries.isNotEmpty()) {
+            val oldest = entries.entries.iterator().next()
+            entries.remove(oldest.key)
+            storedBytes -= oldest.value.bytes.size
         }
+        return key
     }
 
-    /** The value stored at [offset], which is then forgotten; null for none. */
-    fun take(offset: Long): ByteArray? = payloads.remove(offset)?.also { storedBytes -= it.size }
+    /** The value at [key] for [reader]; null if there is none, or the reader took it already. The last reader to take it lets it go. */
+    fun take(reader: Int, key: Long): ByteArray? {
+        val entry = entries[key] ?: return null
+        val bit = 1L shl (reader and READER_MASK)
+        if ((entry.takenBy and bit) != 0L) return null
+        entry.takenBy = entry.takenBy or bit
+        if (Long.SIZE_BITS >= cursors.size && entry.takenBy == allReaders()) {
+            entries.remove(key)
+            storedBytes -= entry.bytes.size
+        }
+        return entry.bytes
+    }
+
+    private fun allReaders(): Long = if (cursors.size >= Long.SIZE_BITS) -1L else (1L shl cursors.size) - 1
 
     private companion object {
         const val MAX_STORED_BYTES = 64L * 1024 * 1024
+        const val READER_MASK = Long.SIZE_BITS - 1
     }
 }
 

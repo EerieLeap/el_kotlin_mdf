@@ -3,6 +3,9 @@ package com.eerie_leap.mdf
 // The header block (HD): its links, then its fields.
 private const val HD_LINK_DATA_GROUP = 0
 private const val HD_LINK_FILE_HISTORY = 1
+private const val HD_LINK_HIERARCHY = 2
+private const val HD_LINK_ATTACHMENT = 3
+private const val HD_LINK_EVENT = 4
 private const val HD_LINK_COMMENT = 5
 private const val HD_START_NS = 0
 private const val HD_TIME_ZONE_OFFSET = 8
@@ -44,16 +47,55 @@ public object Mdf4Reader {
             historyEntry(block, context)
         }
         val groups = StructureLoader(context, ConversionLoader(context)).dataGroups(hd.link(HD_LINK_DATA_GROUP), hd.offset)
+        val index = FileIndex(groups)
+        linkMasters(groups, index, context)
+        val attachments = AttachmentLoader(context).load(hd.link(HD_LINK_ATTACHMENT), hd.offset)
+        val events = EventLoader(context, index, attachments).load(hd.link(HD_LINK_EVENT), hd.offset)
+        val hierarchy = HierarchyLoader(context, index).load(hd.link(HD_LINK_HIERARCHY), hd.offset)
+        skipSampleReductions(groups, context)
         return MdfFile(
             identification = identification,
             header = header,
             history = history,
             comment = context.comment(hd.link(HD_LINK_COMMENT), hd.offset, "the header"),
             groups = groups,
+            hierarchy = hierarchy,
+            events = events,
+            attachments = attachments,
             issues = context.issues,
+            skipped = context.skipped,
             source = source,
             blockOffsets = reader.readBlockOffsets(),
         )
+    }
+
+    // A channel group whose master is in another group names it by link; that group is among the file's.
+    private suspend fun linkMasters(groups: List<MdfDataGroup>, index: FileIndex, context: LoaderContext) {
+        for (group in groups.flatMap { it.channelGroups }.filter { it.hasRemoteMaster }) {
+            val link = group.remoteMasterLink
+            val target = index.channelGroups[link]
+            val subject = "channel group ${group.name}"
+            when {
+                link == 0L -> context.skipped.add(missingMaster(group, "it says its master is elsewhere but names no channel group"))
+
+                target == null -> context.tolerate(subject, Unit) {
+                    damaged(group.offset, "the master of $subject is at byte $link, where no channel group of the file is")
+                }
+
+                else -> group.remoteMaster = target
+            }
+        }
+    }
+
+    private fun missingMaster(group: MdfChannelGroup, reason: String): MdfIssue =
+        MdfIssue(MdfFailure.Unsupported(group.offset, "the master of the channel group", reason), "channel group ${group.name}")
+
+    // Sample reductions repeat the data in summary; the reader leaves them be and says the file has them.
+    private fun skipSampleReductions(groups: List<MdfDataGroup>, context: LoaderContext) {
+        for (group in groups.flatMap { it.channelGroups }.filter { it.hasSampleReductions }) {
+            val failure = MdfFailure.Unsupported(group.offset, "sample reductions", "they repeat the data in summary, which is not read")
+            context.skipped.add(MdfIssue(failure, "channel group ${group.name}"))
+        }
     }
 
     private suspend fun headerBlock(reader: BlockReader): Block {
