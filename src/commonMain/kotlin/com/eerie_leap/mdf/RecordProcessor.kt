@@ -89,13 +89,13 @@ internal class RecordProcessor(
         problem = failure
     }
 
-    /** The data a scan waited for may have grown: let every source look again. */
-    fun retry() {
+    /** The data a scan waited for may have grown: let every source look again, unless the file is [isFinal] and will grow no more. */
+    fun retry(isFinal: Boolean) {
         isWaiting = false
         for (plan in plans) {
-            plan.remoteTimes?.retry()
-            plan.texts.forEach { it.signalData?.retry() }
-            plan.frames?.signalData?.retry()
+            plan.remoteTimes?.retry(isFinal)
+            plan.texts.forEach { it.signalData?.retry(isFinal) }
+            plan.frames?.signalData?.retry(isFinal)
         }
     }
 

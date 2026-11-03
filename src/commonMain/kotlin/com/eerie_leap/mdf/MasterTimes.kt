@@ -27,6 +27,9 @@ internal class MasterTimes(
     // The master's data haven't reached the value wanted yet, in a file still arriving.
     private var isWaiting = false
 
+    // The file will not grow: a value that isn't there yet will not be.
+    private var isFinal = false
+
     /** The read that brings in the values up to the one the last [check] asked for. */
     val fetch: Fetch = Fetch { load(wanted) }
 
@@ -63,9 +66,10 @@ internal class MasterTimes(
         base += drop
     }
 
-    /** The master's file may have grown since a value was waited for. */
-    fun retry() {
+    /** The master's file may have grown since a value was waited for, unless it is [isFinal], which will grow no more. */
+    fun retry(isFinal: Boolean) {
         isWaiting = false
+        this.isFinal = isFinal
     }
 
     private suspend fun load(index: Long) {
@@ -75,11 +79,11 @@ internal class MasterTimes(
         var moved: Boolean
         do {
             val before = scan.bytesRead
-            progress = scan.advance(CHUNK_BYTES)
+            progress = scan.advance(CHUNK_BYTES, isFinal)
             moved = scan.bytesRead > before
         } while (index >= base + size && moved && progress.problem == null)
         if (index >= base + size) {
-            if (progress.isComplete || progress.problem != null) isExhausted = true else isWaiting = true
+            if (progress.isComplete || progress.problem != null || isFinal) isExhausted = true else isWaiting = true
         }
     }
 

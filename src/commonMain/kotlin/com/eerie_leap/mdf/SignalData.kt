@@ -39,6 +39,10 @@ internal class SignalDataValues(private val stream: DataStream) {
     private var streamIsComplete = false
     private var wanted = 0L
 
+    // The file will not grow: a value that isn't there yet will not be. And the stream has looked at the file in this pass.
+    private var isFinal = false
+    private var hasLooked = false
+
     /** What the last [take] found. */
     var lookup = Lookup.Absent
         private set
@@ -55,7 +59,7 @@ internal class SignalDataValues(private val stream: DataStream) {
         if (found == null && lookup == Lookup.Fetching) {
             // Not in the window, or cut by its end. A window that already reaches the end of the data has nothing more to give.
             if (windowIsAtEnd && offset >= windowStart) {
-                lookup = if (streamIsComplete) Lookup.Absent else Lookup.Waiting
+                lookup = if (streamIsComplete || isFinal) Lookup.Absent else Lookup.Waiting
             } else {
                 wanted = offset
             }
@@ -63,8 +67,10 @@ internal class SignalDataValues(private val stream: DataStream) {
         return found
     }
 
-    /** Forget what was found to be missing: the file may have grown since. */
-    fun retry() {
+    /** Forget what was found to be missing: the file may have grown since, unless it is [isFinal], which will grow no more. */
+    fun retry(isFinal: Boolean) {
+        this.isFinal = isFinal
+        hasLooked = false
         windowIsAtEnd = false
         windowSize = 0
     }
@@ -81,9 +87,13 @@ internal class SignalDataValues(private val stream: DataStream) {
     }
 
     private suspend fun load(offset: Long) {
+        if (!hasLooked) {
+            stream.refresh()
+            hasLooked = true
+        }
         val available = stream.available()
         val declared = stream.declaredLength
-        streamIsComplete = declared != null && available >= declared
+        streamIsComplete = declared != null && available >= declared && !stream.isCut
         windowStart = offset
         windowSize = 0
         windowIsAtEnd = true

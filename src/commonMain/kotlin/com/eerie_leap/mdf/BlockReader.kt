@@ -20,6 +20,9 @@ internal object BlockFormat {
 
     /** The most one metadata block (names, conversions, comments) may hold; data blocks aren't read as blocks. */
     const val MAX_METADATA_BLOCK_BYTES = 128L * 1024 * 1024
+
+    /** The most links a block may have: what the largest metadata block holds, which no block (a data block least of all) needs more. */
+    const val MAX_LINKS = MAX_METADATA_BLOCK_BYTES / LINK_SIZE
 }
 
 private const val PAGE_SIZE = 64 * 1024
@@ -71,14 +74,20 @@ internal class BlockHeader(val offset: Long, val type: String, val length: Long,
     /** Where the block's contents begin: after the header and the links. */
     val contentOffset: Long = offset + BlockFormat.HEADER_SIZE + linkCount.toLong() * BlockFormat.LINK_SIZE
 
-    val end: Long get() = offset + length
+    /** The bytes the block holds after its header and links. */
+    val dataLength: Long = length - BlockFormat.HEADER_SIZE - linkCount.toLong() * BlockFormat.LINK_SIZE
+
+    /** Where the block ends, as far as a number goes for a block that claims a length no file has. */
+    val end: Long get() = if (length > Long.MAX_VALUE - offset) Long.MAX_VALUE else offset + length
 }
 
 /**
  * Reads blocks, checking each against the file's size and its own length and its type against what the link to it names. Small
  * reads go through a few cached pages, since a file's blocks are many and small and a source may be slow.
  */
-internal class BlockReader(private val source: MdfSource) {
+internal class BlockReader(source: MdfSource) {
+    // The caller's source as the reader may rely on it: see GuardedSource.
+    private val source: MdfSource = GuardedSource.of(source)
     private val pageStarts = LongArray(PAGE_COUNT) { -1L }
     private val pageValid = IntArray(PAGE_COUNT)
     private val pages = Array(PAGE_COUNT) { ByteArray(0) }
@@ -97,7 +106,8 @@ internal class BlockReader(private val source: MdfSource) {
 
     /** [length] bytes at [position]. Fails as [MdfFailure.Truncated] where the file has fewer. */
     suspend fun bytes(position: Long, length: Int): ByteArray {
-        val end = position + length
+        if (length < 0) damaged(position, "a read of $length bytes at byte $position")
+        val end = if (position > Long.MAX_VALUE - length) Long.MAX_VALUE else position + length
         if (position < 0 || end > sizeReaching(end)) throw MdfException(MdfFailure.Truncated(position, end))
         val result = ByteArray(length)
         if (length >= PAGE_SIZE) {
@@ -138,8 +148,8 @@ internal class BlockReader(private val source: MdfSource) {
      */
     suspend fun blockStart(target: Long, holder: Long, fieldBytes: Int, vararg expected: String): Block {
         val header = header(target, holder, *expected)
-        val wanted = BlockFormat.HEADER_SIZE + header.linkCount * BlockFormat.LINK_SIZE + fieldBytes
-        val length = minOf(header.length, wanted.toLong()).toInt()
+        val wanted = header.contentOffset - target + fieldBytes
+        val length = minOf(header.length, wanted).toInt()
         if (target + length > sizeReaching(target + length)) throw MdfException(MdfFailure.Truncated(target, target + length))
         return Block(target, header.type, bytes(target, length), header.linkCount, header.length)
     }
@@ -165,6 +175,23 @@ internal class BlockReader(private val source: MdfSource) {
         return header to raw.copyOfRange(BlockFormat.HEADER_SIZE, raw.size)
     }
 
+    /**
+     * Whether a block begins at [position]: its header is there and makes sense (the `##` and a type of two letters or digits, the
+     * reserved bytes zero, a length that holds the header and the links the block says it has). A place past the end of the file, or
+     * one that is no multiple of 8, is none.
+     */
+    suspend fun blockBeginsAt(position: Long): Boolean {
+        if (position < BlockFormat.ID_BLOCK_SIZE || position % BlockFormat.ALIGNMENT != 0L) return false
+        val raw = directBytes(position, BlockFormat.HEADER_SIZE)
+        if (raw.size < BlockFormat.HEADER_SIZE) return false
+        val isMarked = raw[0] == BLOCK_MARK[0] && raw[1] == BLOCK_MARK[1]
+        val type = if (isMarked) raw.decodeToString(2, BlockFormat.TYPE_SIZE) else ""
+        val isReserved = raw.u32(BlockFormat.TYPE_SIZE) == 0L
+        val isSound = isSoundSize(raw.u64(BlockFormat.LENGTH_AT), raw.u64(BlockFormat.LINK_COUNT_AT))
+        val isType = type.length == 2 && type.all { it.isBlockTypeCharacter() }
+        return isType && isReserved && isSound
+    }
+
     private fun checkLink(target: Long, holder: Long) {
         val fileSize = sizeReaching(target + BlockFormat.HEADER_SIZE)
         if (isImpossibleLink(target, fileSize)) damaged(holder, "the block at byte $holder links to byte $target, where no block can be")
@@ -173,6 +200,10 @@ internal class BlockReader(private val source: MdfSource) {
         }
     }
 
+    // Whether a block of [length] bytes can have [linkCount] links: the header, and room for the links, and no more than any block needs.
+    private fun isSoundSize(length: Long, linkCount: Long): Boolean = length >= BlockFormat.HEADER_SIZE &&
+        linkCount in 0..minOf((length - BlockFormat.HEADER_SIZE) / BlockFormat.LINK_SIZE, BlockFormat.MAX_LINKS)
+
     private fun headerFrom(raw: ByteArray, target: Long, holder: Long, expected: Array<out String>): BlockHeader {
         val type = typeOf(raw, target)
         if (expected.isNotEmpty() && type !in expected) {
@@ -180,10 +211,7 @@ internal class BlockReader(private val source: MdfSource) {
         }
         val length = raw.u64(BlockFormat.LENGTH_AT)
         val linkCount = raw.u64(BlockFormat.LINK_COUNT_AT)
-        val linkSpace = (length - BlockFormat.HEADER_SIZE) / BlockFormat.LINK_SIZE
-        if (length < BlockFormat.HEADER_SIZE || linkCount < 0 || linkCount > linkSpace) {
-            damaged(target, "block ##$type claims a length of $length bytes and $linkCount links")
-        }
+        if (!isSoundSize(length, linkCount)) damaged(target, "block ##$type claims a length of $length bytes and $linkCount links")
         if (blockCount == blockOffsets.size) blockOffsets = blockOffsets.copyOf(blockCount * 2)
         blockOffsets[blockCount++] = target
         return BlockHeader(target, type, length, linkCount.toInt())

@@ -50,6 +50,7 @@ internal fun zippedBlock(
     zipType: Int = ZIP_DEFLATE,
     columns: Int = 0,
     originalType: String = "DT",
+    links: Int = 0,
 ): TestBlock {
     val data = ByteWriter()
         .bytes(originalType.encodeToByteArray())
@@ -59,7 +60,7 @@ internal fun zippedBlock(
         .u64(plain.size.toLong())
         .u64(zipped.size.toLong())
         .bytes(zipped)
-    return layout.block("DZ", 0, data.toByteArray())
+    return layout.block("DZ", links, data.toByteArray())
 }
 
 private const val STORED_BLOCK_MAX = 65535

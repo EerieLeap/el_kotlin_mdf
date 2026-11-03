@@ -61,7 +61,8 @@ internal object RichFile {
             ByteArray(0),
             dataBlock = { layout ->
                 val dv = chunks(values.toByteArray(), 12 * COLUMN_BLOCK).map { plainPart(layout, it, "DV") }
-                val di = chunks(flags, COLUMN_BLOCK).map { plainPart(layout, it, "DI") }
+                // The invalidation block of the second pair is left out: its records are all valid.
+                val di = chunks(flags, COLUMN_BLOCK).mapIndexed { index, part -> if (index == 1) null else plainPart(layout, part, "DI") }
                 columnList(layout, dv, di, samples = COLUMN_BLOCK.toLong())
             },
         )
@@ -76,7 +77,32 @@ internal object RichFile {
         return DataGroupSpec(2, listOf(remote, other), records.toByteArray())
     }
 
-    fun bytes(): ByteArray {
+    /** The same file as a writer that was cut off leaves it: unfinished, with every flag of what it left stale. */
+    fun unfinished(): ByteArray = bytes(finalized = false)
+
+    /** A file of one data group whose last list isn't filled in, with blocks after it that are the group's own and one that is not. */
+    fun unfilled(): ByteArray = writeFile(
+        FileSpec(
+            listOf(
+                DataGroupSpec(
+                    0,
+                    listOf(sortedGroup(0)),
+                    ByteArray(0),
+                    dataBlock = { layout ->
+                        val list = dataList(layout, listOf(plainPart(layout, sortedRecords(5))), capacity = 4, count = 0)
+                        plainPart(layout, sortedRecords(5, from = 5))
+                        plainPart(layout, sortedRecords(5, from = 10))
+                        zippedBlock(layout, ByteArray(UNFILLED_ZIPPED), zlibStored(ByteArray(UNFILLED_ZIPPED)), originalType = "SD")
+                        list
+                    },
+                ),
+            ),
+            finalized = false,
+            unfinalizedFlags = UNFILLED_FLAGS,
+        ),
+    )
+
+    fun bytes(finalized: Boolean = true): ByteArray {
         val arrayData = arrayRecords()
         val arrayGroup = DataGroupSpec(
             0,
@@ -91,6 +117,8 @@ internal object RichFile {
                 listOf(arrayGroup, textsDataGroup(), columnsDataGroup(), remoteDataGroup()),
                 versionText = "4.20",
                 version = 420,
+                finalized = finalized,
+                unfinalizedFlags = if (finalized) 0 else EVERY_FLAG,
                 extras = { build ->
                     val nodes = listOf(
                         HierarchySpec(
@@ -117,4 +145,7 @@ internal object RichFile {
     private const val COLUMN_RECORDS = 20
     private const val COLUMN_BLOCK = 8
     private const val ATTACHMENT_BYTES = 300
+    private const val UNFILLED_ZIPPED = 40
+    private const val UNFILLED_FLAGS = 0x01 or 0x04 or 0x10
+    private const val EVERY_FLAG = 0x7F
 }

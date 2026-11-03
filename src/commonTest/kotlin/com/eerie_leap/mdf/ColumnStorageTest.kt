@@ -173,14 +173,39 @@ class ColumnStorageTest {
     fun saysAValueBlockThatClaimsMoreBytesThanTheFileHoldsWithOthersAfterItIsDamagedNotAnOutOfMemory() {
         val bytes = fileOf(40) { layout ->
             val dv = chunks(values(0 until 40), 12 * 16).map { plainPart(layout, it, "DV") }
-            val di = chunks(flags(0 until 40), 16).map { plainPart(layout, it, "DI") }
             dv[1].block.declaredLength = HUGE_BLOCK_LENGTH
-            columnList(layout, dv, di, samples = 16)
+            columnList(layout, dv, samples = 16)
         }
 
         val failure = assertIs<MdfFailure.Damaged>(failureOf { scanned(bytes) })
 
         assertTrue(failure.reason.contains("more than the file holds"), failure.reason)
+    }
+
+    @Test
+    fun saysAnInvalidationBlockThatHoldsOtherRecordsThanItsValuesBlockDamagedWhereOthersFollow() {
+        val bytes = fileOf(40) { layout ->
+            val dv = chunks(values(0 until 40), 12 * 16).map { plainPart(layout, it, "DV") }
+            // The second invalidation block holds 15 records of the 16 of its values.
+            val di = chunks(flags(0 until 40), 16).mapIndexed { index, part ->
+                plainPart(
+                    layout,
+                    if (index ==
+                        1
+                    ) {
+                        part.copyOf(15)
+                    } else {
+                        part
+                    },
+                    "DI",
+                )
+            }
+            columnList(layout, dv, di, samples = 16)
+        }
+
+        val failure = assertIs<MdfFailure.Damaged>(failureOf { scanned(bytes) })
+
+        assertTrue(failure.reason.contains("holds 15 records"), failure.reason)
     }
 
     @Test

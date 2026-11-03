@@ -140,6 +140,68 @@ class ArraysTest {
     }
 
     @Test
+    fun makesAChannelOfEachElementOfAnArrayOfInverseLayoutTheFirstIndexRunningFastest() {
+        val out = ByteWriter().f64(0.0)
+        for (i in 0 until 6) out.f32(i * 100f)
+        val spec = ArraySpec(listOf(2, 3), 4, flags = ArraySpec.Flags.INVERSE_LAYOUT)
+        val file = open(fileOf(spec, recordBytes = 32, records = out.toByteArray()))
+
+        val array = arrayOf(file)
+
+        assertTrue(checkNotNull(array.array).hasInverseLayout)
+        assertEquals(
+            listOf("arr[0][0]", "arr[1][0]", "arr[0][1]", "arr[1][1]", "arr[0][2]", "arr[1][2]"),
+            array.members.map { it.name },
+        )
+        assertEquals(listOf(8, 12, 16, 20, 24, 28), array.members.map { it.byteOffset })
+        assertEquals(listOf(100.0), scanElements(file).getValue("arr[1][0]"))
+        assertEquals(listOf(200.0), scanElements(file).getValue("arr[0][1]"))
+    }
+
+    @Test
+    fun givesTheElementsOfAnArrayOfInverseLayoutTheInvalidationBitsOfTheirPlaces() {
+        // Six floats, and the invalidation bit of the third place set: that is the element at index (0, 1) when the first runs fastest.
+        val out = ByteWriter().f64(0.0)
+        for (i in 0 until 6) out.f32(i * 100f)
+        val records = out.u8(0b000100).toByteArray()
+        val spec = ArraySpec(listOf(2, 3), 4, invalidationBitBase = 1, flags = ArraySpec.Flags.INVERSE_LAYOUT)
+        val file = open(fileOf(spec, recordBytes = 32, invalidationBytes = 1, records = records))
+        val array = arrayOf(file)
+        val requests = array.members.map { MdfChannelRequest(it) }
+        val sink = CollectingSink()
+
+        runSuspending { MdfScanner.create(file, file.groups.single(), requests, sink).advance() }
+
+        val invalid = requests.filter { sink.of(it).single().isInvalid }.map { it.channel.name }
+        assertEquals(listOf("arr[0][1]"), invalid)
+    }
+
+    @Test
+    fun listsAnArrayWhoseElementsHaveInvalidationBitsBeyondAnyRecordAndReadsNoneOfThemAsAlwaysValid() {
+        val records = ByteWriter().f64(0.0).f32(1f).f32(2f).f32(3f).u8(0).toByteArray()
+        val spec = ArraySpec(listOf(3), 4, invalidationBitBase = 1L shl 31)
+        val file = open(fileOf(spec, recordBytes = 20, invalidationBytes = 1, records = records))
+
+        val array = arrayOf(file)
+
+        assertTrue(checkNotNull(array.array?.unreadReason).contains("invalidation"), "${array.array}")
+        assertTrue(array.members.isEmpty())
+    }
+
+    @Test
+    fun readsNoAxesOfAnArrayItWillNotRead() {
+        val count = (MAX_ARRAY_ELEMENTS + 1).toInt()
+        val flags = ArraySpec.Flags.AXIS or ArraySpec.Flags.FIXED_AXIS
+        val spec = ArraySpec(listOf(MAX_ARRAY_ELEMENTS + 1), 4, flags = flags, fixedAxes = listOf(List(count) { it.toDouble() }))
+        val file = open(fileOf(spec, recordBytes = 20, records = ByteWriter().f64(0.0).f32(1f).f32(2f).f32(3f).toByteArray()))
+
+        val array = checkNotNull(arrayOf(file).array)
+
+        assertTrue(checkNotNull(array.unreadReason).contains("elements"), array.toString())
+        assertTrue(array.fixedAxes.isEmpty())
+    }
+
+    @Test
     fun readsAMapWithFixedAxesAndKeepsTheAxes() {
         val flags = ArraySpec.Flags.AXIS or ArraySpec.Flags.FIXED_AXIS
         val array = ArraySpec(listOf(2, 3), 4, type = 2, flags = flags, fixedAxes = listOf(listOf(0.0, 1.0), listOf(10.0, 20.0, 30.0)))

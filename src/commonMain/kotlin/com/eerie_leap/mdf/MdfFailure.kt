@@ -42,6 +42,15 @@ public sealed interface MdfFailure {
         override val description: String get() = "Not read, $what at byte $offset: $reason."
     }
 
+    /**
+     * The file's [MdfSource] failed reading at byte [offset], with [message] where it gave one (the file went, a provider failed):
+     * not a fault of the file, and a read the caller may try again.
+     */
+    public data class NotRead(public val offset: Long, public val message: String?) : MdfFailure {
+        override val description: String
+            get() = "The file couldn't be read at byte $offset: ${message ?: "the source failed"}."
+    }
+
     /** The block at byte [offset] holds [size] bytes, more than the [limit] this reader takes of one block. */
     public data class TooLarge(public val offset: Long, public val size: Long, public val limit: Long) : MdfFailure {
         override val description: String get() = "The block at byte $offset holds $size bytes, more than the $limit this reader takes."
@@ -49,4 +58,4 @@ public sealed interface MdfFailure {
 }
 
 /** A file that couldn't be read: [failure] says why, and the message says it in English, for a log. */
-public class MdfException(public val failure: MdfFailure) : Exception(failure.description)
+public class MdfException(public val failure: MdfFailure, cause: Throwable? = null) : Exception(failure.description, cause)

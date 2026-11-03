@@ -97,7 +97,8 @@ internal class SignalData(val bytes: ByteArray, val offsets: List<Long>) {
 internal fun columnList(
     layout: BlockLayout,
     values: List<DataPart>,
-    invalidation: List<DataPart>? = null,
+    /** The invalidation blocks, one for each block of values; a null stands for a link to no block (the records are all valid). */
+    invalidation: List<DataPart?>? = null,
     samples: Long = 0,
     next: TestBlock? = null,
     count: Int = values.size,
@@ -120,7 +121,7 @@ internal fun columnList(
     val list = layout.block("LD", links, data.toByteArray())
     list.links[0] = next
     values.forEachIndexed { index, part -> list.links[1 + index] = part.block }
-    invalidation?.forEachIndexed { index, part -> list.links[1 + values.size + index] = part.block }
+    invalidation?.forEachIndexed { index, part -> list.links[1 + values.size + index] = part?.block }
     return list
 }
 
@@ -147,6 +148,7 @@ internal class ArraySpec(
         const val COMPARISON_QUANTITY = 0x08
         const val AXIS = 0x10
         const val FIXED_AXIS = 0x20
+        const val INVERSE_LAYOUT = 0x40
     }
 }
 

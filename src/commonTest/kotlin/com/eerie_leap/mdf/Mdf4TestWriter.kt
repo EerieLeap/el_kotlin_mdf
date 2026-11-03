@@ -93,6 +93,11 @@ internal class BlockLayout {
 
     fun xml(text: String): TestBlock = block("MD", 0, ByteWriter().paddedText(text).toByteArray())
 
+    /** Puts the blocks in the order [order] gives for the one they are in. */
+    fun reorder(order: (List<TestBlock>) -> List<TestBlock>) {
+        arranged = order(arranged ?: blocks)
+    }
+
     /** Orders the blocks as rt_core's writer does, from the header block [root]. */
     fun arrange(root: TestBlock) {
         val order = ArrayList<TestBlock>()
@@ -335,6 +340,8 @@ internal class FileSpec(
     val tamper: ((List<TestBlock>) -> Unit)? = null,
     /** Called once the groups are written and before the file is laid out, to add what hangs on the header (CH, AT, EV). */
     val extras: ((FileBuild) -> Unit)? = null,
+    /** Puts the blocks in the order the file holds them, from the order the writer chose: for a layout the writer doesn't make. */
+    val reorder: ((List<TestBlock>) -> List<TestBlock>)? = null,
 )
 
 /** What a file's header and groups were written as, for the blocks that refer to them. */
@@ -377,6 +384,7 @@ internal fun writeFile(spec: FileSpec): ByteArray {
     linkRemoteMasters(layout, spec)
     spec.extras?.invoke(FileBuild(layout, hd, dataBlocks.map { it.first }, spec))
     layout.arrange(hd)
+    spec.reorder?.let { layout.reorder(it) }
     spec.tamper?.invoke(layout.all)
     return layout.build(idBlock(spec.finalized, spec.unfinalizedFlags, spec.versionText, spec.version))
 }

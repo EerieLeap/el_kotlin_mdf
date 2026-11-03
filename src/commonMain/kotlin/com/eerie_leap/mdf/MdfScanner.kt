@@ -37,10 +37,19 @@ public class MdfScanProgress(
     public val bytesRead: Long,
     public val bytesAvailable: Long,
     public val bytesDeclared: Long?,
-    /** The scan has read everything the file declares, and nothing more will come. */
+    /**
+     * The scan has read everything the file declares, and nothing more will come: for a file whose last data block has no end
+     * (a null [bytesDeclared]), everything there is once the scan was told the source is final (see [MdfScanner.advance]).
+     */
     public val isComplete: Boolean,
     /** Why the records can't be read on, where they can't: the scan has stopped for good. */
     public val problem: MdfFailure?,
+    /**
+     * The file ends before the lists that name the data's blocks do (a file cut short, or a download that isn't done): some blocks
+     * the file names are not there, [bytesDeclared] is what the lists named so far hold, and the scan is not [isComplete] however
+     * far it has read. A file that grows may fill the lists in.
+     */
+    public val isCut: Boolean = false,
 ) {
     override fun toString(): String = "MdfScanProgress($bytesRead of $bytesAvailable, complete=$isComplete)"
 }
@@ -80,18 +89,24 @@ public class MdfScanner private constructor(
     /**
      * Reads the records the file holds now, at most about [maxBytes] of them, and returns how far it got. A record only part of
      * which is there is left for the next call. It doesn't fail for data it can't read (a zipped block that doesn't inflate, a
-     * record ID no group has): the scan stops there for good, and [MdfScanProgress.problem] says why.
+     * record ID no group has, a source that fails): the scan stops there for good, and [MdfScanProgress.problem] says why.
+     *
+     * A record may wait for data that isn't in the file yet (a value in signal data blocks, a time of a master in another group),
+     * and the scan waits with it for the file to grow. Pass [sourceIsFinal] when no more bytes will come (the file is closed, the
+     * download is done): a record that waits for what the file doesn't have then goes without it, and the scan goes on, instead of
+     * waiting for ever; and a file whose last data block has no end is [MdfScanProgress.isComplete] once everything there is is read.
      */
-    public suspend fun advance(maxBytes: Long = Long.MAX_VALUE): MdfScanProgress {
+    public suspend fun advance(maxBytes: Long = Long.MAX_VALUE, sourceIsFinal: Boolean = false): MdfScanProgress {
         stalled = false
-        processor.retry()
+        processor.retry(sourceIsFinal)
         val available = try {
+            stream.refresh()
             readAvailable(maxBytes)
         } catch (e: MdfException) {
             processor.fail(e.failure)
             position
         }
-        return progress(available)
+        return progress(available, sourceIsFinal)
     }
 
     // Takes the records of the data there is now, up to about maxBytes; the bytes there are.
@@ -153,15 +168,22 @@ public class MdfScanner private constructor(
         return true
     }
 
-    private fun progress(available: Long): MdfScanProgress {
+    private fun progress(available: Long, sourceIsFinal: Boolean): MdfScanProgress {
         val declared = stream.declaredLength
-        val reachedEnd = declared != null && available >= declared && (position >= declared || stalled || processor.finished)
+        val isCut = stream.isCut
+        val isAtEnd = position >= (declared ?: available) || stalled || processor.finished
+        val reachedEnd = when {
+            isCut -> false
+            declared != null -> available >= declared && isAtEnd
+            else -> sourceIsFinal && isAtEnd
+        }
         return MdfScanProgress(
             position,
             available,
             declared,
             isComplete = processor.problem == null && reachedEnd && !processor.isWaiting,
             problem = processor.problem,
+            isCut = isCut,
         )
     }
 

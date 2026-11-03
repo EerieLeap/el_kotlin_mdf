@@ -45,8 +45,9 @@ public enum class MdfArrayStorage(public val code: Int) {
 /**
  * The array (CA) that a channel's composition is: its elements, when they are laid out in the channel's record, are channels of
  * their own ([MdfChannel.members], named `oil_temp[3]`, `m[1][2]`). The element at index (i, j, ...) is at the byte offset of the
- * channel plus [byteOffsetBase] times its place in the array, the last index running fastest. An array this reader doesn't lay
- * out into channels is listed with the reason in [unreadReason], and its channel isn't scanned.
+ * channel plus [byteOffsetBase] times its place in the array, the last index running fastest, or the first for an array of
+ * [hasInverseLayout]. An array this reader doesn't lay out into channels is listed with the reason in [unreadReason], and its
+ * channel isn't scanned.
  */
 @Suppress("LongParameterList") // What a CA block holds, each as the standard names it; the model keeps every one.
 public class MdfChannelArray internal constructor(
@@ -60,22 +61,15 @@ public class MdfChannelArray internal constructor(
     public val byteOffsetBase: Int,
     /** The number of invalidation bits between one element's and the next (`ca_inval_bit_pos_base`). */
     public val invalidationBitBase: Long,
-    /** The values of each dimension's axis, for an array whose axes are fixed numbers; none otherwise. */
-    public val fixedAxes: List<List<Double>>,
+    private val axes: List<DoubleArray>,
     /** Why the elements aren't channels of their own, null where they are. */
     public val unreadReason: String?,
 ) {
+    /** The values of each dimension's axis, for an array whose axes are fixed numbers and which is read; none otherwise. */
+    public val fixedAxes: List<List<Double>> get() = axes.map { it.asList() }
+
     /** The number of elements: the product of the dimensions (capped at [Long.MAX_VALUE]). */
-    public val elementCount: Long
-        get() = dimensions.fold(1L) { product, size ->
-            if (size != 0L &&
-                product > Long.MAX_VALUE / size
-            ) {
-                Long.MAX_VALUE
-            } else {
-                product * size
-            }
-        }
+    public val elementCount: Long get() = countOf(dimensions)
 
     /** The dimensions change at run time, their sizes being values of other channels. */
     public val hasDynamicSize: Boolean get() = (flags and FLAG_DYNAMIC_SIZE) != 0
@@ -86,6 +80,9 @@ public class MdfChannelArray internal constructor(
     /** The axes are numbers stored in the array's block ([fixedAxes]); otherwise they are values of other channels. */
     public val hasFixedAxes: Boolean get() = (flags and FLAG_FIXED_AXIS) != 0
 
+    /** The elements are stored with the first index changing fastest, not the last. */
+    public val hasInverseLayout: Boolean get() = (flags and FLAG_INVERSE_LAYOUT) != 0
+
     override fun toString(): String = "MdfChannelArray($type, ${dimensions.joinToString("x")}${unreadReason?.let {
         ", not read: $it"
     }.orEmpty()})"
@@ -95,8 +92,14 @@ public class MdfChannelArray internal constructor(
         fun unreadable(reason: String): MdfChannelArray =
             MdfChannelArray(MdfArrayType.Unknown, MdfArrayStorage.Unknown, emptyList(), 0, 0, 0L, emptyList(), reason)
 
+        /** The product of [dimensions], as large as a number goes. */
+        fun countOf(dimensions: List<Long>): Long = dimensions.fold(1L) { product, size ->
+            if (size != 0L && product > Long.MAX_VALUE / size) Long.MAX_VALUE else product * size
+        }
+
         const val FLAG_DYNAMIC_SIZE = 0x01
         const val FLAG_AXIS = 0x10
         const val FLAG_FIXED_AXIS = 0x20
+        const val FLAG_INVERSE_LAYOUT = 0x40
     }
 }

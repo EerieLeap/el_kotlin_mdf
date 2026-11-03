@@ -18,18 +18,24 @@ another logger (see Tests).
   2, 4 or 8 bytes), variable-length (VLSD) channels, invalidation bits, structures of channels (CN compositions).
 - Where the data is: DT; DZ (inflated whole, at most 64 MiB, transposed back where its zip type says so); lists of
   blocks, DL, of equal or unequal lengths and chained, and an HL over zipped ones (the length of each block is read from the
-  block itself, since writers get a list's own lengths wrong); SD signal data blocks, alone, in lists and zipped, for the
-  strings and byte arrays of sorted VLSD channels; and MDF 4.2's column storage (an LD list of DV value blocks and DI
-  invalidation blocks, a channel group for each signal, joined to its master with `cg_cg_master`).
+  block itself, since writers get a list's own lengths wrong; a block named twice, or a list of more than two million, is
+  refused); SD signal data blocks, alone, in lists and zipped, for the strings and byte arrays of sorted VLSD channels; and
+  MDF 4.2's column storage (an LD list of DV value blocks and DI invalidation blocks, a channel group for each signal, joined
+  to its master with `cg_cg_master`; the invalidation block of a pair is the one at the same place as its values block, an empty
+  link making the records valid).
 - Files their writer didn't finish (`UnFinMF`, as a unit leaves a log at a power loss, or CANedge does) and files cut
   short (a download in progress): every flag of `id_unfin_flags` is taken for what it says (stale cycle counts, last data
   block, last list not filled in, VLSD byte counts and offsets), and the data is read to the end of the file, up to the last
-  whole record; the cycle counts are the scan's own.
+  whole record; the cycle counts are the scan's own. The last block of such a file is open to the next block or the end of
+  the file only if no block begins where its length says it ends, and is closed again when one does; a list that is not
+  filled in takes the blocks after it only in a file of one data group, and only blocks of its data. A file cut in its lists
+  is scanned as far as they go (`MdfScanProgress.isCut`) and goes on from the list it was cut at when it grows.
 - Masters: in the group's records, in another channel group (a remote master, `MdfChannelGroup.remoteMaster`), or virtual
   (computed from the record index); the axis they make is `MdfChannelGroup.masterAxis` (`MdfSyncType`: time, angle, distance,
   index), and a sample's time is that axis, in its unit.
 - Arrays (CA) of a fixed size: each element is a channel of its own (`oil_temp[3]`, `m[1][2]`, the last index running
-  fastest, at `ca_byte_offset_base` apart), the container keeps `MdfChannel.array` and lists them in `members`.
+  fastest, or the first in an array of inverse layout, at `ca_byte_offset_base` apart), the container keeps `MdfChannel.array`
+  and lists them in `members`.
 - The channel hierarchy (`MdfFile.hierarchy`), the events (`MdfFile.events`: type, range, cause, sync type and value, name,
   comment, parent and range links, the channels and groups it is about) and the attachments (`MdfFile.attachments`: file name,
   MIME type, embedded or not, compressed or not, size, MD5; `MdfFile.readAttachment` gives an embedded file's bytes, inflated).
@@ -50,9 +56,9 @@ another logger (see Tests).
 - Sample reductions (SR) and their data (RD, RV, RI), which only repeat the data in a condensed form: listed in
   `MdfFile.skipped` and `MdfChannelGroup.hasSampleReductions`, never read.
 - Arrays it can't lay out: of dynamic size, with axes taken from other channels, of arrays or structures, with their
-  elements stored in other groups, of more than 4096 elements (or 200,000 in the file). They are in the model with the
-  reason (`MdfChannelArray.unreadReason`), their elements aren't made into channels, and the container is never scanned as a
-  scalar; fixed axes are kept (`fixedAxes`).
+  elements stored in other groups, of more than 4096 elements (or 200,000 in the file), whose elements' invalidation bits lie
+  beyond any record. They are in the model with the reason (`MdfChannelArray.unreadReason`), their elements aren't made into
+  channels, and the container is never scanned as a scalar; the fixed axes of an array that is read are kept (`fixedAxes`).
 - Column storage in an unsorted data group, or with more than one channel group in a data group (`Unsupported`).
 - Zip types other than deflate and transposed deflate, attachments compressed any other way, and attachments that name a
   file instead of holding it.
@@ -73,13 +79,18 @@ val progress = scanner.advance()                 // reads what the source holds 
 
 `MdfSampleSink.onSample(request, time, value, isInvalid)` gets each sample with the group's master converted (seconds for a
 time master); `stored = true` asks for the values as stored. `MdfScanProgress` says how many bytes were read, how many there
-are, whether the file is complete and, if the records can't be read on, why. `MdfScanner.rejected` lists the requests it
-couldn't take (an array, a channel whose signal data is missing) while it scans the rest. `CanFrames` lists a file's CAN
-groups and reads their frames.
+are, whether the file is complete, whether its lists are cut (`isCut`: a file cut short or still arriving, so that
+`bytesDeclared` is what the lists named so far hold) and, if the records can't be read on, why. A record may wait for data that
+isn't in the file yet (a text in signal data, a time of a master in another group) and the scan waits with it; `advance(maxBytes,
+sourceIsFinal = true)` says no more bytes will come, and the record goes without, and the scan goes on, and a file whose last
+block has no end is complete once all of it is read. `MdfScanner.rejected` lists the requests it couldn't take (an array, a
+channel whose signal data is missing) while it scans the rest. `CanFrames` lists a file's CAN groups and reads their frames.
 
 Every failure is an `MdfException` whose `MdfFailure` is for the caller to word: not MDF, a version it doesn't take, cut
 short (`Truncated`: a block, or a link to one, past the end of the file), damaged at a byte (`Damaged`), something it doesn't
-take (`Unsupported`), too large (`TooLarge`). A damaged file fails this way, never with a crash or a hang.
+take (`Unsupported`), too large (`TooLarge`), or not read by its source (`NotRead`: whatever the `MdfSource` throws but
+cancellation, which passes). A damaged file fails this way, never with a crash or a hang, and no read is ever asked of the
+source at a negative position or of a negative length.
 `Mdf4Reader.open(source, lenient = true)` leaves out what it can't read of a file's structure instead (`MdfFile.issues`) and
 reads the rest.
 

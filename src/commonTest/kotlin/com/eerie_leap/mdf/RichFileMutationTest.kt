@@ -25,9 +25,32 @@ class RichFileMutationTest {
         }
         for (data in file.groups) {
             val requests = data.channelGroups.flatMap { group -> group.allChannels.map { MdfChannelRequest(it) } }
-            runSuspending { MdfScanner.create(file, data, requests, CollectingSink()).advance() }
+            val scanner = runSuspending { MdfScanner.create(file, data, requests, CollectingSink()) }
+            runSuspending { scanner.advance() }
+            runSuspending { scanner.advance(sourceIsFinal = true) }
         }
     }
+
+    // The file as it arrives: a scan of each data group over the first two thirds of it, then all of it, then told it is all there is.
+    private fun readGrowing(bytes: ByteArray) {
+        val groups = runCatching { open(bytes, lenient = true).groups.size }.getOrDefault(0)
+        for (index in 0 until groups) readGrowingGroup(bytes, index)
+    }
+
+    private fun readGrowingGroup(bytes: ByteArray, index: Int) {
+        val source = GrowingSource(bytes, bytes.size * 2 / 3)
+        val file = tolerated { runSuspending { Mdf4Reader.open(source, lenient = true) } }
+        val data = file?.groups?.getOrNull(index) ?: return
+        val requests = data.channelGroups.flatMap { group -> group.allChannels.map { MdfChannelRequest(it) } }
+        val scanner = tolerated { runSuspending { MdfScanner.create(file, data, requests, CollectingSink()) } } ?: return
+        runSuspending { scanner.advance() }
+        source.visible = bytes.size
+        runSuspending { scanner.advance() }
+        runSuspending { scanner.advance(sourceIsFinal = true) }
+    }
+
+    // [block]'s result, or null where it fails as a damaged or cut file does; any other failure is the test's.
+    private fun <T> tolerated(block: () -> T): T? = runCatching(block).getOrElse { if (it is MdfException) null else throw it }
 
     private fun mutate(good: ByteArray, random: Random, notes: StringBuilder): ByteArray {
         val bytes = good.copyOf()
@@ -61,22 +84,35 @@ class RichFileMutationTest {
     }
 
     @Test
+    fun theUnfinishedAndUnfilledFilesReadToo() {
+        for (bytes in listOf(RichFile.unfinished(), RichFile.unfilled())) {
+            val file = open(bytes)
+
+            assertTrue(file.issues.isEmpty(), "${file.issues}")
+            readEverything(bytes, lenient = false)
+        }
+    }
+
+    @Test
     fun aDamagedFileOfEveryKindOfBlockFailsOnlyWithMdfExceptions() {
-        val good = RichFile.bytes()
+        val corpus = listOf(RichFile.bytes(), RichFile.unfinished(), RichFile.unfilled())
         val random = Random(SEED)
         // The failures that were not MdfExceptions, one for each place they happened at.
         val failures = LinkedHashMap<String, String>()
 
         repeat(MUTATED_FILES) { index ->
             val notes = StringBuilder()
-            val bytes = mutate(good, random, notes)
-            for (lenient in listOf(false, true)) {
-                runCatching { readEverything(bytes, lenient) }.exceptionOrNull()?.takeIf { it !is MdfException }?.let {
+            val bytes = mutate(corpus[index % corpus.size], random, notes)
+            val reads = listOf<Pair<String, () -> Unit>>(
+                "strict" to { readEverything(bytes, lenient = false) },
+                "lenient" to { readEverything(bytes, lenient = true) },
+                "growing" to { readGrowing(bytes) },
+            )
+            for ((how, read) in reads) {
+                runCatching(read).exceptionOrNull()?.takeIf { it !is MdfException }?.let {
                     val trace = it.stackTraceToString()
                     val place = trace.lineSequence().drop(1).firstOrNull().orEmpty()
-                    failures.getOrPut("${it::class.simpleName} $place") {
-                        "file $index (lenient=$lenient,$notes): ${trace.take(STACK_CHARS)}"
-                    }
+                    failures.getOrPut("${it::class.simpleName} $place") { "file $index ($how,$notes): ${trace.take(STACK_CHARS)}" }
                 }
             }
         }

@@ -25,26 +25,27 @@ internal class ArrayLoader(private val context: LoaderContext) {
         context.tolerate(subject, template.withArray(MdfChannelArray.unreadable("its block can't be read"), emptyList())) {
             val block = context.reader.block(link, holder, "CA")
             block.requireData(CA_DIMENSION_SIZES)
-            val dimensions = dimensionsOf(block)
-            val flags = block.u32AsInt(CA_FLAGS)
-            val axes = if ((flags and MdfChannelArray.FLAG_FIXED_AXIS) != 0) fixedAxes(block, dimensions) else emptyList()
-            val array = MdfChannelArray(
-                type = MdfArrayType.of(block.u8(CA_TYPE)),
-                storage = MdfArrayStorage.of(block.u8(CA_STORAGE)),
-                dimensions = dimensions,
-                flags = flags,
-                byteOffsetBase = block.u32AsInt(CA_BYTE_OFFSET_BASE),
-                invalidationBitBase = block.u32(CA_INVALIDATION_BIT_BASE),
-                fixedAxes = axes,
-                unreadReason = null,
-            )
+            val array = makeArray(block, dimensionsOf(block), emptyList())
             val reason = reasonNotRead(array, block.link(CA_LINK_COMPOSITION) != 0L, template)
             if (reason != null) {
                 template.withArray(withReason(array, reason), emptyList())
             } else {
-                template.withArray(array, elementsOf(template, array))
+                // The axes are read of an array that is read, whose sizes are small, and of no other.
+                val withAxes = if (array.hasFixedAxes) makeArray(block, array.dimensions, fixedAxes(block, array.dimensions)) else array
+                template.withArray(withAxes, elementsOf(template, withAxes))
             }
         }
+
+    private fun makeArray(block: Block, dimensions: List<Long>, axes: List<DoubleArray>) = MdfChannelArray(
+        type = MdfArrayType.of(block.u8(CA_TYPE)),
+        storage = MdfArrayStorage.of(block.u8(CA_STORAGE)),
+        dimensions = dimensions,
+        flags = block.u32AsInt(CA_FLAGS),
+        byteOffsetBase = block.u32AsInt(CA_BYTE_OFFSET_BASE),
+        invalidationBitBase = block.u32(CA_INVALIDATION_BIT_BASE),
+        axes = axes,
+        unreadReason = null,
+    )
 
     private fun dimensionsOf(block: Block): List<Long> {
         val count = block.u16(CA_DIMENSIONS)
@@ -57,13 +58,13 @@ internal class ArrayLoader(private val context: LoaderContext) {
     }
 
     // The numbers of each fixed axis, after the dimension sizes; as many as the dimension has elements.
-    private fun fixedAxes(block: Block, dimensions: List<Long>): List<List<Double>> {
+    private fun fixedAxes(block: Block, dimensions: List<Long>): List<DoubleArray> {
         var at = CA_DIMENSION_SIZES + dimensions.size * U64_SIZE
         var room = (block.dataSize - at) / U64_SIZE
         return dimensions.map { size ->
             if (size > room) damaged(block.offset, "an array's axes are cut short")
             room -= size.toInt()
-            List(size.toInt()) { block.f64(at + it * U64_SIZE) }.also { at += size.toInt() * U64_SIZE }
+            DoubleArray(size.toInt()) { block.f64(at + it * U64_SIZE) }.also { at += size.toInt() * U64_SIZE }
         }
     }
 
@@ -82,11 +83,16 @@ internal class ArrayLoader(private val context: LoaderContext) {
         made + array.elementCount > MAX_ELEMENTS_IN_FILE -> "the file's arrays have more than $MAX_ELEMENTS_IN_FILE elements"
         array.elementCount > 1 && array.byteOffsetBase <= 0 -> "its elements are ${array.byteOffsetBase} bytes apart"
         lastElementOffset(template, array) > Int.MAX_VALUE -> "its elements lie beyond any record"
+        lastInvalidationBit(template, array) > Int.MAX_VALUE -> "its elements' invalidation bits lie beyond any record"
         else -> null
     }
 
     private fun lastElementOffset(template: MdfChannel, array: MdfChannelArray): Long =
         template.byteOffset + array.byteOffsetBase.toLong() * (array.elementCount - 1)
+
+    // The invalidation bit of the last element, 0 for a channel that has none.
+    private fun lastInvalidationBit(template: MdfChannel, array: MdfChannelArray): Long =
+        template.invalidationBit?.let { it + array.invalidationBitBase * (array.elementCount - 1) } ?: 0L
 
     private fun withReason(array: MdfChannelArray, reason: String): MdfChannelArray = MdfChannelArray(
         array.type,
@@ -95,26 +101,33 @@ internal class ArrayLoader(private val context: LoaderContext) {
         array.flags,
         array.byteOffsetBase,
         array.invalidationBitBase,
-        array.fixedAxes,
+        emptyList(),
         reason,
     )
 
-    // One channel for each element, named by its indices: the last index runs fastest in the record.
+    // One channel for each element, named by its indices: the last index runs fastest in the record, or the first in an array of
+    // inverse layout.
     private fun elementsOf(template: MdfChannel, array: MdfChannelArray): List<MdfChannel> {
         val count = array.elementCount.toInt()
         made += count
-        val dimensions = array.dimensions
         return List(count) { linear ->
-            var rest = linear.toLong()
-            val indices = LongArray(dimensions.size)
-            for (d in dimensions.indices.reversed()) {
-                indices[d] = rest % dimensions[d]
-                rest /= dimensions[d]
-            }
+            val indices = indicesOf(linear.toLong(), array)
             val name = template.name + indices.joinToString("") { "[$it]" }
             val offset = template.byteOffset + (array.byteOffsetBase.toLong() * linear).toInt()
             val bit = template.invalidationBit?.let { it + array.invalidationBitBase * linear }
-            template.element(name, offset, bit?.takeIf { it <= Int.MAX_VALUE }?.toInt())
+            template.element(name, offset, bit?.toInt())
         }
+    }
+
+    // The indices, one for each dimension, of the element at place [linear] among the array's.
+    private fun indicesOf(linear: Long, array: MdfChannelArray): LongArray {
+        val dimensions = array.dimensions
+        val indices = LongArray(dimensions.size)
+        var rest = linear
+        for (d in if (array.hasInverseLayout) dimensions.indices else dimensions.indices.reversed()) {
+            indices[d] = rest % dimensions[d]
+            rest /= dimensions[d]
+        }
+        return indices
     }
 }

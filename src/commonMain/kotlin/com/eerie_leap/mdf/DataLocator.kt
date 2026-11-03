@@ -17,16 +17,15 @@ internal object DataLocator {
         return if (reader.header(group.dataLink, group.offset).type == "LD") {
             columns(file, group, reader, lists)
         } else {
-            val again = suspend { freshLists(file).leaves(group.dataLink, group.offset, DataKinds.RECORDS) }
-            streamOf(reader, lists.leaves(group.dataLink, group.offset, DataKinds.RECORDS), again)
+            streamOf(reader, lists.leaves(group.dataLink, group.offset, DataKinds.RECORDS), ListRevisit(file, DataKinds.RECORDS))
         }
     }
 
     /** The variable-length values a channel keeps in signal data blocks (SD, a zipped one, or a list of them) at [link]. */
     suspend fun locateSignalData(file: MdfFile, link: Long, holder: Long): DataStream {
         val reader = BlockReader(file.source)
-        val again = suspend { freshLists(file).leaves(link, holder, DataKinds.SIGNALS) }
-        return streamOf(reader, DataLists(file, reader).leaves(link, holder, DataKinds.SIGNALS), again)
+        val walk = DataLists(file, reader).leaves(link, holder, DataKinds.SIGNALS)
+        return streamOf(reader, walk, ListRevisit(file, DataKinds.SIGNALS))
     }
 
     // A walk of its own, with a reader whose pages are of the file as it is now.
@@ -39,21 +38,39 @@ internal object DataLocator {
                 MdfFailure.Unsupported(group.dataLink, "column storage", "it is read for a sorted data group of one channel group only"),
             )
         }
-        val walk = lists.columns(group.dataLink, group.offset)
         val dataBytes = only.dataBytes.toInt()
         val invalidationBytes = only.invalidationBytes.toInt()
         if (dataBytes + invalidationBytes == 0) return EmptyData
-        val again = suspend { freshLists(file).columns(group.dataLink, group.offset) }
-        return ColumnData(
-            streamOf(reader, walk.values) { again().values },
-            walk.invalidation?.let { found ->
-                streamOf(reader, found) { checkNotNull(again().invalidation) { "the invalidation blocks went" } }
-            },
-            dataBytes,
-            invalidationBytes,
-        )
+        val walk = lists.columns(group.dataLink, group.offset, dataBytes, invalidationBytes)
+        val isEmpty = walk.pairs.isEmpty() && !walk.isCut
+        return if (isEmpty) {
+            EmptyData
+        } else {
+            ColumnData(
+                reader,
+                walk,
+                dataBytes,
+                invalidationBytes,
+                ColumnLists(file, dataBytes, invalidationBytes),
+            )
+        }
     }
 
-    private fun streamOf(reader: BlockReader, walk: Walk, again: (suspend () -> Walk)? = null): DataStream =
-        if (walk.leaves.isEmpty() && !walk.isCut) EmptyData else SegmentedData(reader, walk, if (walk.isCut) again else null)
+    private fun streamOf(reader: BlockReader, walk: Walk, revisit: Revisit): DataStream =
+        if (walk.leaves.isEmpty() && !walk.isCut) EmptyData else SegmentedData(reader, walk, revisit)
+
+    // Looks again at the lists of data blocks of a file that has grown.
+    private class ListRevisit(private val file: MdfFile, private val accepts: Set<String>) : Revisit {
+        override suspend fun resume(previous: Walk): Walk = freshLists(file).resume(previous, accepts)
+
+        override suspend fun settle(last: DataLeaf): DataLeaf = freshLists(file).settle(last)
+    }
+
+    // Looks again at the lists of column storage of a file that has grown.
+    private class ColumnLists(private val file: MdfFile, private val dataBytes: Int, private val invalidationBytes: Int) : ColumnRevisit {
+        override suspend fun resume(previous: ColumnWalk): ColumnWalk =
+            freshLists(file).resumeColumns(previous, dataBytes, invalidationBytes)
+
+        override suspend fun settle(last: DataLeaf): DataLeaf = freshLists(file).settle(last)
+    }
 }

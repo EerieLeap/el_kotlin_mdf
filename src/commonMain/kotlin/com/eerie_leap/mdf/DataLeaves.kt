@@ -27,9 +27,9 @@ internal class LeafReader(private val reader: BlockReader) {
     suspend fun read(link: Long, holder: Long, accepts: Set<String>, inList: Boolean): DataLeaf {
         val (header, extra) = reader.dataHeader(link, holder, ZippedBlock.FIELDS_SIZE)
         return when {
-            header.type == ZIPPED -> zipped(header, extra, accepts)
+            header.type == ZIPPED -> zipped(header, fieldsOf(header, extra), accepts)
 
-            header.type in accepts -> DataLeaf(link, header.contentOffset, header.length - BlockFormat.HEADER_SIZE, null)
+            header.type in accepts -> DataLeaf(link, header.contentOffset, header.dataLength, null)
 
             inList -> damaged(link, "the list of ${accepts.joinToString("/")} data links to ##${header.type} at byte $link")
 
@@ -38,6 +38,10 @@ internal class LeafReader(private val reader: BlockReader) {
             )
         }
     }
+
+    // The fields of a zipped block follow its links, if it has any: the bytes read with the header are them only if it has none.
+    private suspend fun fieldsOf(header: BlockHeader, extra: ByteArray): ByteArray =
+        if (header.linkCount == 0) extra else reader.directBytes(header.contentOffset, ZippedBlock.FIELDS_SIZE)
 
     private fun zipped(header: BlockHeader, fields: ByteArray, accepts: Set<String>): DataLeaf {
         if (fields.size < ZippedBlock.FIELDS_SIZE) throw MdfException(MdfFailure.Truncated(header.offset, header.end))
