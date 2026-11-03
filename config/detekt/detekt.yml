@@ -1,0 +1,76 @@
+# detekt, the linter: https://detekt.dev/docs/next/rules (2.0). The build runs detekt's default rules
+# (buildUponDefaultConfig), and this file changes only what differs from those defaults, each with its reason: the
+# Gefera app's settings, less what concerns its Compose code. Formatting is ktlint's (.editorconfig), so the rules
+# that only restate it are off here. There is no baseline: fix a finding, or, where the code is right as it is,
+# suppress that one finding with @Suppress("RuleName") and a comment saying why.
+
+complexity:
+  CyclomaticComplexMethod:
+    # A when whose branches are single expressions reads as a table, however many branches it has.
+    ignoreSimpleWhenEntries: true
+  LargeClass:
+    # A test class grows with its cases; the code it tests is held to the limit.
+    excludes: &tests
+      - '**/commonTest/**'
+      - '**/jvmTest/**'
+      - '**/iosTest/**'
+  LongParameterList:
+    # Parameters with defaults are options a caller may leave out.
+    ignoreDefaultParameters: true
+  TooManyFunctions:
+    excludes: *tests
+    # Counts a type's or a file's API: its private helpers and overrides aren't part of it.
+    ignorePrivate: true
+    ignoreOverridden: true
+    ignoreDeprecated: true
+
+exceptions:
+  InstanceOfCheckForException:
+    excludes: *tests
+  ThrowingExceptionsWithoutMessageOrCause:
+    excludes: *tests
+  TooGenericExceptionCaught:
+    excludes: *tests
+
+naming:
+  FunctionNaming:
+    excludes: *tests
+  PackageNaming:
+    # The package is com.eerie_leap.mdf, after the company.
+    packagePattern: '[a-z]+(\.[a-z][A-Za-z0-9_]*)*'
+
+performance:
+  ForEachOnRange:
+    excludes: *tests
+  SpreadOperator:
+    excludes: *tests
+
+potential-bugs:
+  UnsafeCallOnNullableType:
+    excludes: *tests
+
+style:
+  MagicNumber:
+    # Tests and build scripts are made of numbers.
+    excludes:
+      - '**/commonTest/**'
+      - '**/jvmTest/**'
+      - '**/iosTest/**'
+      - '**/*.kts'
+    # An enum entry names its number.
+    ignoreEnums: true
+  MaxLineLength:
+    # ktlint's max-line-length (max_line_length in .editorconfig).
+    active: false
+  NewLineAtEndOfFile:
+    # ktlint's final-newline.
+    active: false
+  ReturnCount:
+    # An early return that guards the rest of the function keeps it flat.
+    excludeGuardClauses: true
+  ThrowsCount:
+    # A guard clause that throws at the top of a function is a precondition, not control flow.
+    excludeGuardClauses: true
+  WildcardImport:
+    # ktlint's no-wildcard-imports.
+    active: false
