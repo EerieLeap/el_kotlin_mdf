@@ -1,0 +1,178 @@
+package com.eerie_leap.mdf
+
+private const val FULL_BUFFER_BYTES = 1024 * 1024
+private const val MIN_BUFFER_BYTES = 64 * 1024
+private const val MAX_BUFFER_BYTES = 80 * 1024 * 1024
+
+/**
+ * A channel whose samples a scan hands over. The samples are the channel's converted values (the physical ones) unless [stored]
+ * is set, which asks for the values as they are stored: for a channel with a conversion, say, to draw the raw value. A channel with
+ * a conversion to texts (an enumeration) gives its stored numbers either way, and [MdfConversion.toText] labels them.
+ */
+public class MdfChannelRequest(public val channel: MdfChannel, public val stored: Boolean = false) {
+    override fun toString(): String = "MdfChannelRequest(${channel.name}${if (stored) ", stored" else ""})"
+}
+
+/** Where a scan hands what it reads. */
+public interface MdfSampleSink {
+    /**
+     * A sample of a numeric channel: at [time] (the group's master through its conversion: seconds for a time master; the record's
+     * number for a group without one) the channel was [value]. An [isInvalid] sample has no value: the writer set its invalidation
+     * bit, and [value] is what it stored in its place.
+     */
+    public fun onSample(request: MdfChannelRequest, time: Double, value: Double, isInvalid: Boolean)
+
+    /** A value of a string or byte array channel: a byte array as hexadecimal pairs. */
+    public fun onText(request: MdfChannelRequest, time: Double, text: String, isInvalid: Boolean) {}
+
+    /** A CAN frame of a group asked for as frames. */
+    public fun onCanFrame(group: MdfChannelGroup, frame: MdfCanFrame) {}
+}
+
+/**
+ * How far a scan has got. [bytesRead] of the data group's data are behind it, of the [bytesAvailable] there are now; the file
+ * declares [bytesDeclared] (null for the last data block of a file its writer didn't finish, which has no end yet).
+ */
+public class MdfScanProgress(
+    public val bytesRead: Long,
+    public val bytesAvailable: Long,
+    public val bytesDeclared: Long?,
+    /** The scan has read everything the file declares, and nothing more will come. */
+    public val isComplete: Boolean,
+    /** Why the records can't be read on, where they can't: the scan has stopped for good. */
+    public val problem: MdfFailure?,
+) {
+    override fun toString(): String = "MdfScanProgress($bytesRead of $bytesAvailable, complete=$isComplete)"
+}
+
+/**
+ * Reads the records of a data group and hands the samples of the channels asked for to a sink, without holding the data: it reads
+ * through the file's source in blocks. [advance] reads what the file holds now and returns; for a file still arriving (a log being
+ * downloaded, or one the unit is still writing) call it again as the source grows and it goes on where it stopped, keeping a
+ * record it has only part of for the next time.
+ *
+ * An unsorted data group's records are told apart by their record ID; a group of variable-length values (strings, CAN payloads)
+ * has its records read to join them to the records that name them. A file its writer didn't finish has its cycle counts stale
+ * and the length of its last data block too: the scan counts the records itself (see [cycleCount]) and takes the data to the end
+ * of the file, stopping at the last whole record. A finished file cut short (a download that isn't done) has its data block run
+ * past the end of the file, and is read the same way up to the end, though it isn't [MdfScanProgress.isComplete].
+ */
+public class MdfScanner private constructor(
+    private val stream: DataStream,
+    private val processor: RecordProcessor,
+    private val plans: List<GroupPlan>,
+    /** The requests that couldn't be planned, and why; the rest are scanned. */
+    public val rejected: List<MdfIssue>,
+) {
+    private var buffer = ByteArray(0)
+    private var position = 0L
+    private var stalled = false
+
+    /** The bytes of the data group's data behind the scan. */
+    public val bytesRead: Long get() = position
+
+    /** The records of [group] the scan has gone through. */
+    public fun cycleCount(group: MdfChannelGroup): Long = plans.firstOrNull { it.group === group }?.cycles ?: 0L
+
+    /** The CAN frames whose payload was never found, among those asked for. */
+    public val unresolvedFrames: Long get() = processor.unresolvedFrames()
+
+    /**
+     * Reads the records the file holds now, at most about [maxBytes] of them, and returns how far it got. A record only part of
+     * which is there is left for the next call. It doesn't fail for data it can't read (a zipped block that doesn't inflate, a
+     * record ID no group has): the scan stops there for good, and [MdfScanProgress.problem] says why.
+     */
+    public suspend fun advance(maxBytes: Long = Long.MAX_VALUE): MdfScanProgress {
+        stalled = false
+        val available = try {
+            readAvailable(maxBytes)
+        } catch (e: MdfException) {
+            processor.fail(e.failure)
+            position
+        }
+        return progress(available)
+    }
+
+    // Takes the records of the data there is now, up to about maxBytes; the bytes there are.
+    private suspend fun readAvailable(maxBytes: Long): Long {
+        var consumedHere = 0L
+        var available = stream.available()
+        while (!isStopped && consumedHere < maxBytes && position < available) {
+            fitBuffer(available - position)
+            val wanted = minOf(buffer.size.toLong(), available - position).toInt()
+            val read = stream.read(position, buffer, 0, wanted)
+            val stopAt = minOf(maxBytes - consumedHere, Int.MAX_VALUE.toLong()).toInt()
+            val consumed = if (read > 0) processor.process(buffer, read, position, stopAt) else 0
+            position += consumed
+            consumedHere += consumed
+            if (consumed == 0 && !isStopped && !makeRoom(read)) break
+            available = stream.available()
+        }
+        return stream.available()
+    }
+
+    private val isStopped: Boolean get() = processor.problem != null || processor.finished
+
+    // A buffer of a megabyte for data that fills it, less for a little, kept for the next call.
+    private fun fitBuffer(remaining: Long) {
+        val wanted = minOf(FULL_BUFFER_BYTES.toLong(), maxOf(MIN_BUFFER_BYTES.toLong(), remaining)).toInt()
+        if (buffer.size < wanted) buffer = ByteArray(wanted)
+    }
+
+    // After a pass that took no record: false where the scan must wait for more bytes, true where the buffer was too small for the
+    // record and has grown (or the record is beyond what a buffer may be, and the scan has failed).
+    private fun makeRoom(read: Int): Boolean {
+        if (read < buffer.size) {
+            // Everything that is there was in the buffer, and no record in it is whole.
+            stalled = true
+            return false
+        }
+        val needed = maxOf(processor.needed, buffer.size + 1)
+        if (needed > MAX_BUFFER_BYTES) {
+            processor.fail(MdfFailure.TooLarge(stream.origin + position, needed.toLong(), MAX_BUFFER_BYTES.toLong()))
+            return false
+        }
+        buffer = ByteArray(minOf(maxOf(needed, buffer.size * 2), MAX_BUFFER_BYTES))
+        return true
+    }
+
+    private fun progress(available: Long): MdfScanProgress {
+        val declared = stream.declaredLength
+        val reachedEnd = declared != null && available >= declared && (position >= declared || stalled || processor.finished)
+        return MdfScanProgress(
+            position,
+            available,
+            declared,
+            isComplete = processor.problem == null && reachedEnd,
+            problem = processor.problem,
+        )
+    }
+
+    public companion object {
+        /**
+         * Starts a scan of the records of [dataGroup] of [file], handing the samples of [channels] (channels of the data group's
+         * channel groups) and the frames of [canGroups] (`CAN_DataFrame` groups of it) to [sink]. It locates the data and checks
+         * what it is asked for against the layout; a request it can't take is left out and listed in [rejected].
+         *
+         * Fails with an [MdfException]: [MdfFailure.Unsupported] for a way of storing the data this reader doesn't read, a
+         * [MdfFailure.TooLarge] zipped block, a [MdfFailure.Damaged] data group.
+         */
+        public suspend fun create(
+            file: MdfFile,
+            dataGroup: MdfDataGroup,
+            channels: List<MdfChannelRequest>,
+            sink: MdfSampleSink,
+            canGroups: List<MdfChannelGroup> = emptyList(),
+        ): MdfScanner {
+            val planned = ScanPlanner(dataGroup).plan(channels, canGroups)
+            val stream = DataLocator.locate(file, dataGroup)
+            // A zipped block that is all there is inflated now, so a damaged one fails here, not in the middle of a scan.
+            stream.available()
+            val countsAreTrue = file.identification.isFinalized || UnfinalizedFlag.CycleCounts !in file.identification.unfinalized
+            val single = planned.groups.singleOrNull()
+            val limit = if (dataGroup.isSorted && countsAreTrue) single?.group?.cycleCount else null
+            val processor = RecordProcessor(dataGroup.recordIdSize, planned.groups, sink, limit, stream.origin)
+            return MdfScanner(stream, processor, planned.groups, planned.rejected)
+        }
+    }
+}
