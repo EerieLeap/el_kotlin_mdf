@@ -1,0 +1,9 @@
+{"family":"empty","description":"Extra: a closed log with no record.","logging_interval_ms":100,"origin_us":1761127859317500,"origin_note":"unit-clock microseconds of the first file's header start (RtcProvider's fixed date plus uptime); every *_rel_us is microseconds after it","metadata":{"device_name":"esp32s3_pm_hw_02","tool_id":"rt_daq","tool_version":"1.3.0","product_id":50177,"device_id":2,"hw_version":33619968,"sw_version":16973824,"sensors_configuration_hash":0},"sensors":[{"index":0,"id":"oil_pressure","type":"PHYSICAL_ANALOG","name":"Oil pressure","unit":"bar","description":"sump, before the filter","expression":"sqrt(x) * 2 + 1","sensor_enabled":true,"logging_enabled":true,"log_raw_value":true,"log_only_new_data":false,"bus_channel":null,"has_channel_group":true,"has_raw_channel":true,"mdf_formula":"sqrt(X) * 2 + 1"},
+{"index":1,"id":"ignition","type":"PHYSICAL_INDICATOR","name":"Ignition","unit":"","description":"key switch","expression":"","sensor_enabled":true,"logging_enabled":true,"log_raw_value":true,"log_only_new_data":false,"bus_channel":null,"has_channel_group":true,"has_raw_channel":false,"mdf_formula":null},
+{"index":2,"id":"engine_power","type":"VIRTUAL_ANALOG","name":"Engine power","unit":"kW","description":"torque times speed","expression":"","sensor_enabled":true,"logging_enabled":true,"log_raw_value":false,"log_only_new_data":true,"bus_channel":null,"has_channel_group":true,"has_raw_channel":false,"mdf_formula":null}],"tick_times_rel_us":[],"rotations":0,
+"files":[
+{"name":"empty.mf4","role":"closed","description":"A session started and stopped before its first tick: the three sensors of values.mf4, closed, no record, every count 0.","derived_from":null,"cut":null,"size":3112,"start_rel_us":0,"end_rel_us":0,"header_bytes":3112,"finalized":true,"record_spans":[]}
+],
+"calls":[
+
+]}
