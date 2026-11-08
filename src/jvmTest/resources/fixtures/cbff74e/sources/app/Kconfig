@@ -1,0 +1,59 @@
+menu "Zephyr"
+source "Kconfig.zephyr"
+endmenu
+
+config EERIE_LEAP_HW_VERSION_MAJOR
+	int "Hardware version major"
+	range 0 255
+	default 0
+
+config EERIE_LEAP_HW_VERSION_MINOR
+	int "Hardware version minor"
+	range 0 255
+	default 0
+
+config EERIE_LEAP_HW_VERSION_PATCH
+	int "Hardware version patch"
+	range 0 65535
+	default 0
+
+config EERIE_LEAP_SW_VERSION_MAJOR
+	int "Software version major"
+	range 0 255
+	default 0
+
+config EERIE_LEAP_SW_VERSION_MINOR
+	int "Software version minor"
+	range 0 255
+	default 0
+
+config EERIE_LEAP_SW_VERSION_PATCH
+	int "Software version patch"
+	range 0 65535
+	default 0
+
+config EERIE_LEAP_SW_VERSION_BUILD
+	int "Software build number"
+	range 0 255
+	default 0
+
+config EERIE_LEAP_CANBUS_AUTO_DETECT_INTERVAL_MS
+	int "Canbus auto detect activity check interval ms"
+	default 5000
+
+config EERIE_LEAP_FS_SD_THREAD_STACK_SIZE
+	int "SD thread stack size"
+	default 3072
+
+config EERIE_LEAP_SD_CHECK_INTERVAL_MS
+	int "SD check interval ms"
+	default 1000
+
+
+config LOGGING_UNIT_TEST_DUMP_DIR
+	string "Host directory the mdf4_logger suite writes its CAN file into (empty: not written)"
+	default ""
+	depends on ARCH_POSIX
+	help
+	  Only native_sim reaches the host file system: it links the host libc, so std::ofstream
+	  writes there. Other platforms do not link std::ofstream at all.
