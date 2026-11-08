@@ -133,3 +133,7 @@ also writes the first frames asammdf reads) and the test runs from then on; with
 
 A git submodule at `el_kotlin_mdf/`, which the app's build includes as a composite build, its coordinates
 `com.eerie_leap:el_kotlin_mdf`. The Kotlin version follows the app's: both builds load one Kotlin Gradle plugin.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE).
