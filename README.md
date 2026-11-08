@@ -43,6 +43,10 @@ another logger (see Tests).
   unary minus, parentheses, `sin cos tan sqrt abs log`; anything else leaves the values as stored), value-to-value tables
   with and without interpolation, value ranges to values, values and value ranges to texts, text to value, text to text,
   bit fields to texts. A type it doesn't take is `MdfConversion.Unsupported`, which says why.
+- Channel ranges: a channel's value range (`MdfChannel.valueRange`, `cn_val_range_*`, flag bit 3), its limits
+  (`MdfChannel.limits`, `cn_limit_min` and `cn_limit_max`, flag bit 4: the physical values it is expected to stay in) and its
+  extended limits (`MdfChannel.extendedLimits`, `cn_limit_ext_*`, flag bit 5), each only where its flag says it is valid and
+  its minimum does not exceed its maximum.
 - Values: integers of any bit count to 64 at any bit offset, both byte orders; floats of 16, 32 and 64 bits; strings
   (Latin-1, UTF-8, UTF-16) and byte arrays (for a readout).
 - ASAM bus logging: `CAN_DataFrame` groups as `MdfCanFrame`s, joined to their payloads by offset (or read from the record
@@ -116,7 +120,10 @@ that overflow, a list that links to the wrong block, an attachment past the end,
 file, of the firmware's log and of a file with a block of every kind (`RichFile`), with numbers set to the values that
 overflow: whatever the damage, reading ends in an `MdfException` or in what the file still holds.
 
-On the JVM the reader is checked against the firmware's real logs and asammdf's values (`FirmwareFixturesTest`) and against
+On the JVM the reader is checked against the firmware's real logs and asammdf's values (`FirmwareFixturesTest`, for the
+logs of rt_core 5427774, and `Cbff74eFixturesTest`, for those of cbff74e, which also carry the channels' sources and limits, the
+unit's UID, boot and session, a clock set to real time, the configurations attached to the file and the event that ends it: both
+share `FixtureChecks`; see `src/jvmTest/resources/fixtures/cbff74e/README.md`) and against
 a matrix of files asammdf 8.8.27 writes (`AsammdfMatrixTest`): MDF 4.00, 4.10 and 4.20; plain, deflated and transposed
 data in lists; strings and invalidation bits; masters that are angles, distances and indexes; many groups; arrays, events
 and attachments; every kind of conversion; and column storage. The files and asammdf's values for them (`expected_*.json`)

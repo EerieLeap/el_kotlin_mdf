@@ -44,6 +44,10 @@ private const val CN_INVALIDATION_BIT = 16
 private const val CN_PRECISION = 20
 private const val CN_RANGE_MIN = 24
 private const val CN_RANGE_MAX = 32
+private const val CN_LIMIT_MIN = 40
+private const val CN_LIMIT_MAX = 48
+private const val CN_LIMIT_EXT_MIN = 56
+private const val CN_LIMIT_EXT_MAX = 64
 private const val CN_FIELDS_SIZE = 72
 
 private const val MAX_COMPOSITION_DEPTH = 8
@@ -125,7 +129,9 @@ internal class StructureLoader(private val context: LoaderContext, private val c
             conversion = conversion,
             source = context.source(block.link(CN_LINK_SOURCE), block.offset, subject),
             members = composition.members,
-            valueRange = valueRange(block, flags),
+            valueRange = pair(block, flags, MdfChannel.FLAG_RANGE_VALID, CN_RANGE_MIN, CN_RANGE_MAX),
+            limits = pair(block, flags, MdfChannel.FLAG_LIMIT_VALID, CN_LIMIT_MIN, CN_LIMIT_MAX),
+            extendedLimits = pair(block, flags, MdfChannel.FLAG_EXTENDED_LIMIT_VALID, CN_LIMIT_EXT_MIN, CN_LIMIT_EXT_MAX),
             precision = if ((flags and MdfChannel.FLAG_PRECISION_VALID) != 0) block.u8(CN_PRECISION) else null,
             compositionType = composition.type,
             signalDataLink = signalDataLink(block, kind),
@@ -151,10 +157,17 @@ internal class StructureLoader(private val context: LoaderContext, private val c
         return value
     }
 
-    private fun valueRange(block: Block, flags: Int): ClosedFloatingPointRange<Double>? {
-        if ((flags and MdfChannel.FLAG_RANGE_VALID) == 0) return null
-        val min = block.f64(CN_RANGE_MIN)
-        val max = block.f64(CN_RANGE_MAX)
+    // A pair of doubles the flag says is valid: none where the flag is off, a value is not a number or the pair is the wrong way round.
+    private fun pair(
+        block: Block,
+        flags: Int,
+        flag: Int,
+        minField: Int,
+        maxField: Int,
+    ): ClosedFloatingPointRange<Double>? {
+        if ((flags and flag) == 0) return null
+        val min = block.f64(minField)
+        val max = block.f64(maxField)
         return if (min <= max) min..max else null
     }
 

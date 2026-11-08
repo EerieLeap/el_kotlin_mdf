@@ -307,4 +307,45 @@ class ConversionsTest {
         assertEquals(-5.0..40.0, channelOf(open(bytes)).valueRange)
         assertNull(channelOf(open(fileOf(null))).valueRange)
     }
+
+    @Test
+    fun readsTheChannelsLimitsAndExtendedLimitsBesideItsValueRange() {
+        val both = ChannelSpec("v", DataTypes.FLOAT_LE, 64, valueRange = -5.0..40.0, limits = 0.0..1.0, extendedLimits = -2.0..3.5)
+        val channel = channelOf(open(oneChannelFile(both)))
+
+        assertEquals(0.0..1.0, channel.limits)
+        assertEquals(-2.0..3.5, channel.extendedLimits)
+        assertEquals(-5.0..40.0, channel.valueRange)
+    }
+
+    @Test
+    fun aChannelWhoseLimitFlagsAreOffHasNoLimits() {
+        val channel = channelOf(open(oneChannelFile(ChannelSpec("v", DataTypes.FLOAT_LE, 64))))
+
+        assertNull(channel.limits)
+        assertNull(channel.extendedLimits)
+    }
+
+    @Test
+    fun limitsAndExtendedLimitsAreReadIndependently() {
+        val onlyLimits = channelOf(open(oneChannelFile(ChannelSpec("v", DataTypes.FLOAT_LE, 64, limits = 10.0..20.0))))
+        assertEquals(10.0..20.0, onlyLimits.limits)
+        assertNull(onlyLimits.extendedLimits)
+
+        val onlyExtended = channelOf(open(oneChannelFile(ChannelSpec("v", DataTypes.FLOAT_LE, 64, extendedLimits = -1.0..1.0))))
+        assertNull(onlyExtended.limits)
+        assertEquals(-1.0..1.0, onlyExtended.extendedLimits)
+    }
+
+    @Test
+    fun limitsThatAreTheWrongWayRoundOrNotNumbersAreNone() {
+        val reversed = ChannelSpec("v", DataTypes.FLOAT_LE, 64, limits = 5.0..1.0, extendedLimits = Double.NaN..Double.NaN)
+        val channel = channelOf(open(oneChannelFile(reversed)))
+
+        assertNull(channel.limits)
+        assertNull(channel.extendedLimits)
+    }
+
+    private fun oneChannelFile(channel: ChannelSpec): ByteArray =
+        writeFile(FileSpec(listOf(DataGroupSpec(1, listOf(GroupSpec(1, "g", listOf(channel), 8)), ByteArray(0)))))
 }

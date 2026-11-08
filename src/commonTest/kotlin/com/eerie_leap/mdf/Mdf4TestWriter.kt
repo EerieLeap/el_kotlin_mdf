@@ -31,6 +31,8 @@ internal object ChannelFlags {
     const val INVALIDATION_BIT_VALID = 0x02
     const val PRECISION_VALID = 0x04
     const val RANGE_VALID = 0x08
+    const val LIMIT_VALID = 0x10
+    const val EXTENDED_LIMIT_VALID = 0x20
     const val BUS_EVENT = 0x400
 }
 
@@ -282,6 +284,10 @@ internal class ChannelSpec(
     val source: SourceSpec? = null,
     val signalData: GroupSpec? = null,
     val valueRange: ClosedFloatingPointRange<Double>? = null,
+    /** `cn_limit_min` and `cn_limit_max`, with their flag. */
+    val limits: ClosedFloatingPointRange<Double>? = null,
+    /** `cn_limit_ext_min` and `cn_limit_ext_max`, with their flag. */
+    val extendedLimits: ClosedFloatingPointRange<Double>? = null,
     /** The array (CA) the channel's composition is; [members] are then ignored. */
     val array: ArraySpec? = null,
     /** The signal data (SD) block, list or header the channel keeps its values in, made with the file's layout. */
@@ -475,11 +481,14 @@ private fun channelData(channel: ChannelSpec): ByteArray {
     var flags = channel.flags
     if (channel.invalidationBit != null) flags = flags or ChannelFlags.INVALIDATION_BIT_VALID
     if (channel.valueRange != null) flags = flags or ChannelFlags.RANGE_VALID
+    if (channel.limits != null) flags = flags or ChannelFlags.LIMIT_VALID
+    if (channel.extendedLimits != null) flags = flags or ChannelFlags.EXTENDED_LIMIT_VALID
     return ByteWriter().u8(channel.type).u8(channel.syncType).u8(channel.dataType).u8(channel.bitOffset)
         .u32(channel.byteOffset.toLong()).u32(channel.bitCount.toLong()).u32(flags.toLong()).u32((channel.invalidationBit ?: 0).toLong())
         .u8(0).u8(0).u16(0)
         .f64(channel.valueRange?.start ?: 0.0).f64(channel.valueRange?.endInclusive ?: 0.0)
-        .f64(0.0).f64(0.0).f64(0.0).f64(0.0)
+        .f64(channel.limits?.start ?: 0.0).f64(channel.limits?.endInclusive ?: 0.0)
+        .f64(channel.extendedLimits?.start ?: 0.0).f64(channel.extendedLimits?.endInclusive ?: 0.0)
         .toByteArray()
 }
 

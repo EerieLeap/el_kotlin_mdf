@@ -130,6 +130,16 @@ public class MdfChannel internal constructor(
     public val members: List<MdfChannel>,
     /** The range the stored values are in (`cn_val_range_min` and `cn_val_range_max`), where the channel says one. */
     public val valueRange: ClosedFloatingPointRange<Double>?,
+    /**
+     * The limits the physical (converted) values are expected to stay in (`cn_limit_min` and `cn_limit_max`), where the channel says
+     * them (`cn_flags` bit 4). A writer states what the signal can be, not what the values were: a plot may draw its axis from it.
+     */
+    public val limits: ClosedFloatingPointRange<Double>? = null,
+    /**
+     * The extended limits of the physical values (`cn_limit_ext_min` and `cn_limit_ext_max`), the range the signal can reach at all,
+     * where the channel says them (`cn_flags` bit 5).
+     */
+    public val extendedLimits: ClosedFloatingPointRange<Double>? = null,
     /** The decimals to show (`cn_precision`), where the channel says it. */
     public val precision: Int?,
     internal val compositionType: String?,
@@ -174,13 +184,13 @@ public class MdfChannel internal constructor(
     /** The channel with [members] and [array] set: the elements of an array, made from the channel as the loader found it. */
     internal fun withArray(array: MdfChannelArray, members: List<MdfChannel>): MdfChannel = MdfChannel(
         offset, name, unit, comment, kind, syncType, dataType, byteOffset, bitOffset, bitCount, flags, invalidationBit, conversion, source,
-        members, valueRange, precision, compositionType, signalDataLink, array,
+        members, valueRange, limits, extendedLimits, precision, compositionType, signalDataLink, array,
     ).also { it.signalDataGroup = signalDataGroup }
 
     /** One element of the array this channel is, named [name], [byteOffset] bytes into the record, with its invalidation bit. */
     internal fun element(name: String, byteOffset: Int, invalidationBit: Int?): MdfChannel = MdfChannel(
         offset, name, unit, comment, kind, MdfSyncType.None, dataType, byteOffset, bitOffset, bitCount, flags, invalidationBit, conversion,
-        source, emptyList(), valueRange, precision, null, 0L, null,
+        source, emptyList(), valueRange, limits, extendedLimits, precision, null, 0L, null,
     )
 
     override fun toString(): String = "MdfChannel($name, $kind, $dataType, byte $byteOffset bit $bitOffset+$bitCount)"
@@ -190,6 +200,8 @@ public class MdfChannel internal constructor(
         const val FLAG_INVALIDATION_BIT_VALID = 0x0002
         const val FLAG_PRECISION_VALID = 0x0004
         const val FLAG_RANGE_VALID = 0x0008
+        const val FLAG_LIMIT_VALID = 0x0010
+        const val FLAG_EXTENDED_LIMIT_VALID = 0x0020
         const val FLAG_DISCRETE = 0x0040
         const val FLAG_CALCULATED = 0x0100
         const val FLAG_BUS_EVENT = 0x0400
