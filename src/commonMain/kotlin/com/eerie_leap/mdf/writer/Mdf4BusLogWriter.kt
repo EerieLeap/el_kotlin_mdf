@@ -15,7 +15,7 @@ public class Mdf4BusLogOptions(
     public val toolId: String = "el_kotlin_mdf",
     public val toolVendor: String = "Eerie Leap",
     public val toolVersion: String = "1.0",
-    /** The program in the identification block, in up to eight characters. */
+    /** The program in the identification block: printable ASCII, up to eight characters (a longer text is cut). */
     public val programId: String = "ELMDF",
     /** The header's time class (`hd_time_class`): 0 for a local PC's clock, 10 for an external source. */
     public val timeClass: Int = 0,
@@ -29,11 +29,19 @@ public class Mdf4BusLogOptions(
  * While it writes, the file is as a unit leaves one it did not close: its identifier is `UnFinMF` with the unfinalized flags set
  * for the cycle counts, the length of the data block and the byte counts of the payloads. [Mdf4Reader][com.eerie_leap.mdf.Mdf4Reader]
  * and other tools read it as far as it goes, to the last whole record. [flush] writes what is held and brings the lengths and the
- * counts up to date, so a file read after it holds every record added before it; [finish] does the same, appends the events and
- * makes the file a finished one. Only a small buffer is held in memory (64 KiB of records), and the events until [finish]: they come
- * after the data, which grows to the end of the file.
+ * counts up to date, so a file read after it holds every record and event added before it; [finish] does the same and makes the
+ * file a finished one. Only a small buffer is held in memory (64 KiB of records).
  *
- * One thread at a time may use a writer.
+ * **Events.** Room for 64 KiB of events (about 300 of them, with their names and comments) is kept between the head and the data,
+ * and [flush] writes the events added since the last one there, in place, so a crash loses none that a flush covered. Events that
+ * do not fit are held in memory until [finish], which appends them after the data.
+ *
+ * **Failure.** When the sink throws, the writer fails: the exception is rethrown, [isFailed] is true, and every later call throws an
+ * [IllegalStateException] (a buffer is never appended twice). What the sink holds is what an unfinished log holds, as far as the
+ * last [flush] that returned.
+ *
+ * **Threads.** A writer is for one caller at a time: the caller serializes its calls, and a call made while another runs fails with an
+ * [IllegalStateException] where that is noticed (it is a check, not a lock).
  */
 public class Mdf4BusLogWriter private constructor(
     private val sink: MdfSink,
@@ -41,7 +49,12 @@ public class Mdf4BusLogWriter private constructor(
     private val head: BusLogHead,
 ) {
     private val records = LittleEndianBuffer(BUFFER_BYTES)
-    private val events = ArrayList<PendingEvent>()
+    private val pending = ArrayList<PendingEvent>()
+    private var eventsWritten = 0
+    private var regionCursor = head.eventRegion.start
+    private var lastEventLink = head.eventRegion.link
+    private var isBusy = false
+    private var failure: Exception? = null
     private var payloadBytes = 0L
     private var dataBytes = 0L
     private var patched = Counters(-1, -1, -1, -1)
@@ -55,7 +68,7 @@ public class Mdf4BusLogWriter private constructor(
         private set
 
     /** Events added. */
-    public val eventCount: Int get() = events.size
+    public val eventCount: Int get() = eventsWritten + pending.size
 
     /** The time of the latest frame added, in microseconds, or 0. */
     public var lastTimeMicros: Long = 0
@@ -63,6 +76,9 @@ public class Mdf4BusLogWriter private constructor(
 
     /** The bytes of the file so far, not counting what is held in the buffer: the sink's position. */
     public val bytesWritten: Long get() = sink.position
+
+    /** The sink threw: the writer takes no more calls. */
+    public val isFailed: Boolean get() = failure != null
 
     /** [finish] was called: nothing more can be added. */
     public var isFinished: Boolean = false
@@ -83,8 +99,30 @@ public class Mdf4BusLogWriter private constructor(
         sink.flush()
     }
 
+    // Every public call goes through this: one at a time, and none after the writer failed.
+    private inline fun <T> operation(block: () -> T): T {
+        check(!isBusy) { "the writer is used from two places at once: it is for one caller at a time" }
+        failure?.let { throw IllegalStateException("the log failed: ${it.message}", it) }
+        isBusy = true
+        try {
+            return block()
+        } finally {
+            isBusy = false
+        }
+    }
+
+    // What touches the sink goes through this: its exception fails the writer.
+    @Suppress("TooGenericExceptionCaught") // Whatever the sink throws fails the writer, and is rethrown as it was.
+    private inline fun <T> toSink(block: () -> T): T = try {
+        block()
+    } catch (e: Exception) {
+        failure = e
+        throw e
+    }
+
     /**
-     * Adds a CAN frame: [timeMicros] from the start, on [bus] (as the caller numbers its buses, 0 to 255), with [id] (11 bits, or 29
+     * Adds a CAN frame: [timeMicros] from the start, on [bus] (0 to 255, as the file numbers it: the Eerie Leap firmware writes its
+     * CAN interface + 1, and 0 means the bus is not known, which tools such as asammdf read as any bus), with [id] (11 bits, or 29
      * where [isExtended]) and the first [length] bytes of [data]. A frame longer than 8 bytes is a CAN FD frame and [isFd] must say
      * so; its length is one of 12, 16, 20, 24, 32, 48 and 64. [isTransmit] is a frame the logger sent, [isBitRateSwitch] and
      * [hasErrorState] the FD flags BRS and ESI.
@@ -101,7 +139,7 @@ public class Mdf4BusLogWriter private constructor(
         isBitRateSwitch: Boolean = false,
         hasErrorState: Boolean = false,
         length: Int = data.size,
-    ) {
+    ): Unit = operation {
         checkOpen()
         requireFrame(timeMicros, bus, id, isExtended)
         require(length in 0..data.size) { "a frame of $length bytes from data of ${data.size}" }
@@ -129,7 +167,7 @@ public class Mdf4BusLogWriter private constructor(
         dlc: Int,
         isExtended: Boolean = false,
         isTransmit: Boolean = false,
-    ) {
+    ): Unit = operation {
         checkOpen()
         requireFrame(timeMicros, bus, id, isExtended)
         require(dlc in 0..MAX_DLC) { "a data length code of $dlc" }
@@ -143,7 +181,7 @@ public class Mdf4BusLogWriter private constructor(
 
     /**
      * Adds an event at [timeMicros]: a gap, a mark, a change of the bus state, the end of the recording. Its [name] and [comment] are
-     * what a reader shows. Events are written when the file is finished.
+     * what a reader shows. They are written to the file by the next [flush], or by [finish].
      */
     public fun addEvent(
         timeMicros: Long,
@@ -151,35 +189,42 @@ public class Mdf4BusLogWriter private constructor(
         comment: String? = null,
         type: MdfEventType = MdfEventType.Marker,
         cause: MdfEventCause = MdfEventCause.Other,
-    ) {
+    ): Unit = operation {
         checkOpen()
         require(timeMicros >= 0) { "an event at $timeMicros µs" }
         require(type != MdfEventType.Unknown && cause != MdfEventCause.Unknown) { "an event of an unknown type or cause" }
-        events.add(PendingEvent(timeMicros, name, comment, type, cause))
+        pending.add(PendingEvent(timeMicros, name, comment, type, cause))
     }
 
     /**
-     * Hands the records held to the sink, brings the data block's length, the cycle counts and the payloads' byte count up to date and
-     * flushes the sink: the file now holds every record added so far.
+     * Hands the records held to the sink, writes the events added since the last flush, brings the data block's length, the cycle
+     * counts and the payloads' byte count up to date and flushes the sink: the file now holds every record and event added so far.
      */
-    public fun flush() {
+    public fun flush(): Unit = operation {
         checkOpen()
         writeRecords()
+        toSink { sink.flush() }
+        writeRegionEvents()
         patchCounts()
-        sink.flush()
+        toSink { sink.flush() }
     }
 
     /**
-     * Ends the log: flushes, appends the events, makes the file finished (the identifier `MDF`, no unfinalized flags). Nothing can be
-     * added afterwards. Calling it again does nothing.
+     * Ends the log: writes what is held, appends the events that did not fit the room kept for them, and makes the file a finished
+     * one (the identifier `MDF`, no unfinalized flags), in that order, flushing the sink between the steps so that the identifier is
+     * the last to change. Nothing can be added afterwards. Calling it again does nothing.
      */
-    public fun finish() {
-        if (isFinished) return
+    public fun finish(): Unit = operation {
+        if (isFinished) return@operation
         writeRecords()
+        writeRegionEvents()
+        val tail = appendTailEvents()
+        toSink { sink.flush() }
         patchCounts()
-        writeEvents()
-        sink.overwrite(0, identificationBlock(options.programId, isFinished = true))
-        sink.flush()
+        tail?.let { overwrite(lastEventLink, it) }
+        toSink { sink.flush() }
+        toSink { sink.overwrite(0, identificationBlock(options.programId, isFinished = true)) }
+        toSink { sink.flush() }
         isFinished = true
     }
 
@@ -187,7 +232,7 @@ public class Mdf4BusLogWriter private constructor(
 
     private fun requireFrame(timeMicros: Long, bus: Int, id: Long, isExtended: Boolean) {
         require(timeMicros >= 0) { "a frame at $timeMicros µs" }
-        require(bus in 0..MAX_BUS) { "bus $bus" }
+        require(bus in 0..MAX_BUS) { "bus $bus is not a bus number from 0 to $MAX_BUS" }
         require(id >= 0 && id <= if (isExtended) MAX_EXTENDED_ID else MAX_STANDARD_ID) {
             "id 0x${id.toString(HEX_RADIX)} is not ${if (isExtended) "an extended" else "a standard"} identifier"
         }
@@ -199,7 +244,7 @@ public class Mdf4BusLogWriter private constructor(
 
     private fun writeRecords() {
         if (records.size == 0) return
-        sink.append(records.array, 0, records.size)
+        toSink { sink.append(records.array, 0, records.size) }
         records.clear()
     }
 
@@ -209,40 +254,66 @@ public class Mdf4BusLogWriter private constructor(
         val now = Counters(frameCount, remoteFrameCount, payloadBytes, dataBytes)
         if (now == patched) return
         if (now.data != patched.data) {
-            sink.overwrite(
-                head.dataBlockOffset + DATA_BLOCK_LENGTH_AT,
-                LittleEndianBuffer().u64(DATA_BLOCK_HEADER_BYTES + dataBytes).toByteArray(),
-            )
+            overwrite(head.dataBlockOffset + DATA_BLOCK_LENGTH_AT, DATA_BLOCK_HEADER_BYTES + dataBytes)
         }
         if (now.frames != patched.frames || now.payload != patched.payload) {
-            sink.overwrite(head.dataFrames.cycleCount, LittleEndianBuffer().u64(frameCount).toByteArray())
-            sink.overwrite(head.payloads.cycleCount, LittleEndianBuffer().u64(frameCount).toByteArray())
+            overwrite(head.dataFrames.cycleCount, frameCount)
+            overwrite(head.payloads.cycleCount, frameCount)
             // The byte count of a group of payloads is a 64-bit number in the two 32-bit fields of data and invalidation bytes.
-            sink.overwrite(head.payloads.dataBytes, LittleEndianBuffer().u64(payloadBytes).toByteArray())
+            overwrite(head.payloads.dataBytes, payloadBytes)
         }
-        if (now.remote != patched.remote) {
-            sink.overwrite(head.remoteFrames.cycleCount, LittleEndianBuffer().u64(remoteFrameCount).toByteArray())
-        }
+        if (now.remote != patched.remote) overwrite(head.remoteFrames.cycleCount, remoteFrameCount)
         patched = now
     }
 
-    // The events go after the data block, on a multiple of 8, and the header block links to the first.
-    private fun writeEvents() {
-        if (events.isEmpty()) return
-        val padding = OutBlockSet.alignedUp(sink.position) - sink.position
-        if (padding > 0) sink.append(ByteArray(padding.toInt()))
-        val set = OutBlockSet(sink.position)
-        var previous: OutBlock? = null
-        var first: OutBlock? = null
-        for (event in events) {
-            val block = eventBlock(set, event)
-            if (first == null) first = block else previous?.links?.set(0, block)
-            previous = block
-        }
-        val bytes = set.layOut()
-        sink.append(bytes)
-        sink.overwrite(head.eventsLink, LittleEndianBuffer().u64(checkNotNull(first).offset).toByteArray())
+    private fun overwrite(position: Long, value: Long) {
+        toSink { sink.overwrite(position, LittleEndianBuffer().u64(value).toByteArray()) }
     }
+
+    // The events that fit the room kept for them go there, in place, and the chain's last link is made to name the first.
+    private fun writeRegionEvents() {
+        var cursor = regionCursor
+        var count = 0
+        while (count < pending.size) {
+            val size = eventSize(pending[count])
+            if (cursor + size > head.eventRegion.end) break
+            cursor += size
+            count++
+        }
+        if (count == 0) return
+        val set = OutBlockSet(regionCursor)
+        val blocks = chain(set, pending.subList(0, count))
+        val bytes = set.layOut()
+        toSink { sink.overwrite(regionCursor, bytes) }
+        overwrite(lastEventLink, blocks.first().offset)
+        lastEventLink = blocks.last().linkOffset(EV_LINK_NEXT)
+        regionCursor = cursor
+        eventsWritten += count
+        pending.subList(0, count).clear()
+    }
+
+    // The events that did not fit go after the data block, on a multiple of 8. Returns where the first is, to link to once the data is
+    // safe, or null where there are none.
+    private fun appendTailEvents(): Long? {
+        if (pending.isEmpty()) return null
+        val padding = OutBlockSet.alignedUp(sink.position) - sink.position
+        if (padding > 0) toSink { sink.append(ByteArray(padding.toInt())) }
+        val set = OutBlockSet(sink.position)
+        val blocks = chain(set, pending)
+        val bytes = set.layOut()
+        toSink { sink.append(bytes) }
+        eventsWritten += pending.size
+        pending.clear()
+        return blocks.first().offset
+    }
+
+    private fun chain(set: OutBlockSet, events: List<PendingEvent>): List<OutBlock> {
+        val blocks = events.map { eventBlock(set, it) }
+        for (i in 0 until blocks.size - 1) blocks[i].links[EV_LINK_NEXT] = blocks[i + 1]
+        return blocks
+    }
+
+    private fun eventSize(event: PendingEvent): Long = OutBlockSet(0).also { eventBlock(it, event) }.end()
 
     private fun eventBlock(set: OutBlockSet, event: PendingEvent): OutBlock {
         val data = LittleEndianBuffer().u8(event.type.code).u8(SYNC_TIME).u8(RANGE_POINT).u8(event.cause.code).u8(0).zeros(RESERVED_FLAGS)
@@ -273,6 +344,7 @@ public class Mdf4BusLogWriter private constructor(
         public fun begin(sink: MdfSink, options: Mdf4BusLogOptions): Mdf4BusLogWriter {
             require(sink.position == 0L) { "the sink already holds ${sink.position} bytes" }
             require(options.timeClass in 0..UByte.MAX_VALUE.toInt()) { "time class ${options.timeClass}" }
+            require(isAscii(options.programId)) { "the program id ${options.programId} is not printable ASCII" }
             return Mdf4BusLogWriter(sink, options, busLogHead(options))
         }
 
@@ -303,6 +375,7 @@ public class Mdf4BusLogWriter private constructor(
         private const val RANGE_POINT = 0
         private const val RESERVED_FLAGS = 3
         private const val EV_LINKS = 5
+        private const val EV_LINK_NEXT = 0
         private const val EV_LINK_NAME = 3
         private const val EV_LINK_COMMENT = 4
     }

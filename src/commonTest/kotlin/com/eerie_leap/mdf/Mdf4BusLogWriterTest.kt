@@ -1,6 +1,7 @@
 package com.eerie_leap.mdf
 
 import com.eerie_leap.mdf.writer.InMemoryMdfSink
+import com.eerie_leap.mdf.writer.Mdf4BusLogOptions
 import com.eerie_leap.mdf.writer.Mdf4BusLogWriter
 import com.eerie_leap.mdf.writer.MdfSink
 import kotlin.test.Test
@@ -267,6 +268,8 @@ class Mdf4BusLogWriterTest {
 
         assertFailsWith<IllegalArgumentException> { writer.addFrame(-1, 0, 1, ByteArray(0)) }
         assertFailsWith<IllegalArgumentException> { writer.addFrame(0, 256, 1, ByteArray(0)) }
+        assertFailsWith<IllegalArgumentException> { writer.addFrame(0, -1, 1, ByteArray(0)) }
+        assertFailsWith<IllegalArgumentException> { writer.addRemoteFrame(0, -1, 1, 0) }
         assertFailsWith<IllegalArgumentException> { writer.addFrame(0, 0, 0x800, ByteArray(0)) }
         assertFailsWith<IllegalArgumentException> { writer.addFrame(0, 0, 0x2000_0000, ByteArray(0), isExtended = true) }
         assertFailsWith<IllegalArgumentException> { writer.addFrame(0, 0, 1, ByteArray(9)) }
@@ -349,6 +352,229 @@ class Mdf4BusLogWriterTest {
         assertEquals(listOf(1), read.remote.map { it.bus }.distinct())
     }
 
+    @Test
+    fun aFlushWritesTheEventsAddedSoFarSoACrashKeepsThem() {
+        val sink = InMemoryMdfSink()
+        val writer = Mdf4BusLogWriter.begin(sink, TEST_OPTIONS)
+        writer.addFrame(1_000, 0, 0x100, byteArrayOf(1))
+        writer.addEvent(1_500, "first", "one")
+        writer.flush()
+        val afterFirst = sink.toByteArray()
+        writer.addFrame(2_000, 0, 0x101, byteArrayOf(2))
+        writer.addEvent(2_500, "second", null, MdfEventType.AcquisitionInterrupt, MdfEventCause.Error)
+        writer.addEvent(3_000, "third", "three")
+        writer.flush()
+        val afterSecond = sink.toByteArray()
+        writer.addEvent(4_000, "not flushed")
+
+        // The file as the app finds it after a crash: not finished, never past the last flush.
+        val first = open(afterFirst)
+        val second = open(afterSecond)
+
+        assertFalse(first.identification.isFinalized)
+        assertEquals(listOf("first"), first.events.map { it.name })
+        assertEquals(listOf("one"), first.events.map { it.comment.text })
+        assertEquals(listOf("first", "second", "third"), second.events.map { it.name })
+        assertEquals(listOf(MdfEventType.Marker, MdfEventType.AcquisitionInterrupt, MdfEventType.Marker), second.events.map { it.type })
+        assertEquals(2, readBack(second).data.size)
+        assertEquals(4, writer.eventCount)
+        writer.finish()
+        assertEquals(listOf("first", "second", "third", "not flushed"), open(sink.toByteArray()).events.map { it.name })
+    }
+
+    @Test
+    fun eventsBeyondTheRoomKeptForThemWaitForFinishAndKeepTheirOrder() {
+        val sink = InMemoryMdfSink()
+        val writer = Mdf4BusLogWriter.begin(sink, TEST_OPTIONS)
+        val comment = "x".repeat(200)
+        val count = 1_000
+        for (i in 0 until count) {
+            writer.addFrame(i * 10L, 0, 0x100, byteArrayOf(i.toByte()))
+            writer.addEvent(i * 10L + 1, "event $i", comment)
+        }
+
+        writer.flush()
+        val inTheRoom = open(sink.toByteArray()).events
+
+        assertTrue(inTheRoom.isNotEmpty() && inTheRoom.size < count, "${inTheRoom.size} events in the room")
+        assertEquals(List(inTheRoom.size) { "event $it" }, inTheRoom.map { it.name })
+        assertEquals(count, writer.eventCount)
+        writer.finish()
+        val all = open(sink.toByteArray())
+        assertEquals(List(count) { "event $it" }, all.events.map { it.name })
+        assertTrue(all.events.all { it.comment.text == comment })
+        assertEquals(count, readBack(all).data.size)
+    }
+
+    @Test
+    fun finishMakesTheDataSafeBeforeTheLinksAndTheIdentifierAndTheIdentifierLast() {
+        val sink = OrderSink()
+        val writer = Mdf4BusLogWriter.begin(sink, TEST_OPTIONS)
+        repeat(3_000) { writer.addFrame(it * 10L, 0, 0x100, ByteArray(8)) }
+        repeat(400) { writer.addEvent(it.toLong(), "event $it", "x".repeat(100)) }
+        sink.operations.clear()
+
+        writer.finish()
+
+        val ops = sink.operations
+        val lastAppend = ops.indexOfLast { it == "append" }
+        assertTrue(ops.subList(lastAppend, ops.size).drop(1).first() == "flush", "the data is flushed before anything is patched: $ops")
+        assertEquals("overwrite 0", ops.last { it.startsWith("overwrite") }, "the identifier is the last overwrite: $ops")
+        val identifier = ops.lastIndexOf("overwrite 0")
+        assertEquals("flush", ops[identifier - 1], "the links and counts are flushed before the identifier: $ops")
+        assertEquals("flush", ops.last(), "the identifier is flushed")
+        assertTrue(ops.subList(lastAppend, identifier).any { it.startsWith("overwrite") })
+        assertTrue(open(sink.bytes()).identification.isFinalized)
+    }
+
+    @Test
+    fun aCallMadeWhileAnotherRunsFailsFast() {
+        val sink = ReentrantSink()
+        val writer = Mdf4BusLogWriter.begin(sink, TEST_OPTIONS)
+        sink.writer = writer
+        writer.addFrame(5, 0, 1, ByteArray(0))
+        sink.armed = true
+
+        writer.flush()
+
+        assertTrue(sink.seen is IllegalStateException, "${sink.seen}")
+        assertFalse(writer.isFailed)
+        assertEquals(1, readBack(sink.inner.toByteArray()).data.size)
+    }
+
+    @Test
+    fun theProgramIdIsAsciiAndFitsItsField() {
+        assertFailsWith<IllegalArgumentException> {
+            Mdf4BusLogWriter.begin(InMemoryMdfSink(), Mdf4BusLogOptions(0, programId = "ELMDF\u00e9"))
+        }
+
+        val cut = writeBusLog(emptyList(), options = Mdf4BusLogOptions(0, programId = "ELMDFxyz12"))
+        val short = writeBusLog(emptyList(), options = Mdf4BusLogOptions(0, programId = "EL"))
+
+        assertEquals("ELMDFxyz", open(cut).identification.program)
+        assertEquals("EL", open(short).identification.program)
+    }
+
+    @Test
+    fun afterTheSinkThrowsTheWriterFailsAndNeverAppendsAgain() {
+        val sink = FailingSink(failAppend = 2)
+        val writer = Mdf4BusLogWriter.begin(sink, TEST_OPTIONS)
+        repeat(10) { writer.addFrame(it * 10L, 0, 0x100, ByteArray(8)) }
+        sink.failing = true
+        val appends = sink.appends
+
+        assertFailsWith<SinkFailure> { writer.flush() }
+        assertFailsWith<IllegalStateException> { writer.addFrame(1, 0, 1, ByteArray(0)) }
+        assertFailsWith<IllegalStateException> { writer.addRemoteFrame(1, 0, 1, 0) }
+        assertFailsWith<IllegalStateException> { writer.addEvent(1, "x") }
+        assertFailsWith<IllegalStateException> { writer.flush() }
+        assertFailsWith<IllegalStateException> { writer.finish() }
+
+        assertTrue(writer.isFailed)
+        assertFalse(writer.isFinished)
+        assertEquals(appends + 1, sink.appends, "only the append that failed was tried")
+    }
+
+    @Test
+    fun theFirstSinkExceptionIsTheOneRethrown() {
+        val sink = FailingSink(failAppend = Int.MAX_VALUE)
+        val writer = Mdf4BusLogWriter.begin(sink, TEST_OPTIONS)
+        writer.addFrame(1, 0, 1, ByteArray(0))
+        sink.failing = true
+
+        val thrown = assertFailsWith<SinkFailure> { writer.finish() }
+
+        assertEquals("the sink failed", thrown.message)
+        assertTrue(writer.isFailed)
+    }
+
+    @Test
+    fun aFailureInAnOverwriteFailsTheWriterToo() {
+        val sink = FailingSink(failAppend = Int.MAX_VALUE)
+        val writer = Mdf4BusLogWriter.begin(sink, TEST_OPTIONS)
+        writer.addFrame(1, 0, 1, ByteArray(0))
+        sink.failOverwrite = true
+
+        assertFailsWith<SinkFailure> { writer.flush() }
+
+        assertTrue(writer.isFailed)
+        assertFailsWith<IllegalStateException> { writer.finish() }
+    }
+
+    private class SinkFailure(message: String) : Exception(message)
+
+    /** A sink that, once armed, calls the writer back from inside its next append. */
+    private class ReentrantSink : MdfSink {
+        val inner = InMemoryMdfSink()
+        var writer: Mdf4BusLogWriter? = null
+        var armed = false
+        var seen: Throwable? = null
+
+        override val position: Long get() = inner.position
+
+        override fun append(bytes: ByteArray, offset: Int, length: Int) {
+            if (armed) seen = runCatching { writer?.addFrame(1, 0, 1, ByteArray(0)) }.exceptionOrNull()
+            armed = false
+            inner.append(bytes, offset, length)
+        }
+
+        override fun overwrite(position: Long, bytes: ByteArray) = inner.overwrite(position, bytes)
+
+        override fun flush() = inner.flush()
+    }
+
+    /** A sink that notes the order of what is done to it. */
+    private class OrderSink : MdfSink {
+        private val inner = InMemoryMdfSink()
+        val operations = ArrayList<String>()
+
+        override val position: Long get() = inner.position
+
+        override fun append(bytes: ByteArray, offset: Int, length: Int) {
+            operations.add("append")
+            inner.append(bytes, offset, length)
+        }
+
+        override fun overwrite(position: Long, bytes: ByteArray) {
+            operations.add("overwrite $position")
+            inner.overwrite(position, bytes)
+        }
+
+        override fun flush() {
+            operations.add("flush")
+            inner.flush()
+        }
+
+        fun bytes(): ByteArray = inner.toByteArray()
+    }
+
+    /** A sink that throws once told to, or from the [failAppend]th append on. */
+    private class FailingSink(private val failAppend: Int) : MdfSink {
+        private val inner = InMemoryMdfSink()
+        var failing = false
+        var failOverwrite = false
+        var appends = 0
+            private set
+
+        override val position: Long get() = inner.position
+
+        override fun append(bytes: ByteArray, offset: Int, length: Int) {
+            appends++
+            if (failing || appends >= failAppend) {
+                failing = false
+                throw SinkFailure("the sink failed")
+            }
+            inner.append(bytes, offset, length)
+        }
+
+        override fun overwrite(position: Long, bytes: ByteArray) {
+            if (failOverwrite) throw SinkFailure("the sink failed")
+            inner.overwrite(position, bytes)
+        }
+
+        override fun flush() = inner.flush()
+    }
+
     /** A sink that keeps the file and notes the largest piece appended at once. */
     private class CountingSink : MdfSink {
         private val inner = InMemoryMdfSink()
@@ -360,7 +586,8 @@ class Mdf4BusLogWriterTest {
         override val position: Long get() = inner.position
 
         override fun append(bytes: ByteArray, offset: Int, length: Int) {
-            largestAppend = maxOf(largestAppend, length)
+            // The first append is the head, with the room kept for events; the records follow in pieces of the buffer's size.
+            if (inner.position > 0) largestAppend = maxOf(largestAppend, length)
             inner.append(bytes, offset, length)
         }
 

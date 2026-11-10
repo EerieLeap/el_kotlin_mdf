@@ -4,6 +4,9 @@ package com.eerie_leap.mdf.writer
 // 1-byte record IDs: the payloads, the data frames, the remote frames) and the ASAM bus logging standard describes.
 
 internal const val ID_BLOCK_BYTES = 64
+
+/** The room for events between the head and the data (a multiple of 8). */
+internal const val EVENT_REGION_BYTES = 64 * 1024
 internal const val RECORD_ID_PAYLOAD = 1
 internal const val RECORD_ID_DATA_FRAME = 2
 internal const val RECORD_ID_REMOTE_FRAME = 3
@@ -25,6 +28,7 @@ private const val VERSION = 410
 private const val FINISHED_TEXT = "MDF"
 private const val UNFINISHED_TEXT = "UnFinMF"
 private const val ID_TEXT_BYTES = 8
+private const val SPACE: Byte = 0x20
 private const val ID_PADDING = 4
 private const val ID_RESERVED = 30
 
@@ -93,19 +97,25 @@ internal class BusLogHead(
     val bytes: ByteArray,
     /** Where the data block (DT) begins: the last of [bytes], whose records follow. */
     val dataBlockOffset: Long,
-    /** The place in the header block (HD) of the link to the first event. */
-    val eventsLink: Long,
+    /** The room kept for events, and the link to the first of them. */
+    val eventRegion: EventRegion,
     val payloads: GroupPlace,
     val dataFrames: GroupPlace,
     val remoteFrames: GroupPlace,
 )
+
+/** The room kept for events, from [start] to [end], and [link], the place in the header block (HD) of the link to the first event. */
+internal class EventRegion(val start: Long, val end: Long, val link: Long)
 
 /** Where the cycle count and the data byte count of a channel group are written. */
 internal class GroupPlace(val cycleCount: Long, val dataBytes: Long)
 
 /** The identification block (ID) of a file the writer is still writing, or of one it finished. */
 internal fun identificationBlock(programId: String, isFinished: Boolean): ByteArray {
-    fun text(value: String) = value.padEnd(ID_TEXT_BYTES, ' ').take(ID_TEXT_BYTES).encodeToByteArray()
+    // The fields are ASCII text of 8 bytes: padded with spaces, or cut, as bytes.
+    fun text(value: String) = value.encodeToByteArray().copyOf(ID_TEXT_BYTES).also { bytes ->
+        for (i in value.length until ID_TEXT_BYTES) bytes[i] = SPACE
+    }
     return LittleEndianBuffer(ID_BLOCK_BYTES)
         .bytes(text(if (isFinished) FINISHED_TEXT else UNFINISHED_TEXT))
         .bytes(text(VERSION_TEXT))
@@ -153,6 +163,7 @@ internal fun busLogHead(options: Mdf4BusLogOptions): BusLogHead {
     remoteFrames.links[CG_LINK_CHANNELS] = remoteFrameChannels(set)
 
     // The data block, with the header of a block alone: its length is that of the header until the records are counted.
+    val eventRegion = set.gap(EVENT_REGION_BYTES)
     val dataBlock = set.block("DT", 0)
     dg.links[DG_LINK_DATA] = dataBlock
     val body = set.layOut()
@@ -161,7 +172,7 @@ internal fun busLogHead(options: Mdf4BusLogOptions): BusLogHead {
             ID_BLOCK_BYTES + body.size,
         ).bytes(identificationBlock(options.programId, false)).bytes(body).toByteArray(),
         dataBlockOffset = dataBlock.offset,
-        eventsLink = hd.linkOffset(HD_LINK_EVENTS),
+        eventRegion = EventRegion(eventRegion.offset, eventRegion.offset + EVENT_REGION_BYTES, hd.linkOffset(HD_LINK_EVENTS)),
         payloads = placeOf(payloads),
         dataFrames = placeOf(dataFrames),
         remoteFrames = placeOf(remoteFrames),
@@ -282,3 +293,8 @@ private fun remoteFrameChannels(set: OutBlockSet): OutBlock? {
     timestamp.links[LINK_NEXT] = frame
     return timestamp
 }
+
+/** Whether [text] is printable ASCII, as the identification block's text fields are. */
+internal fun isAscii(text: String): Boolean = text.all { it.code in PRINTABLE_ASCII }
+
+private val PRINTABLE_ASCII = 0x20..0x7E

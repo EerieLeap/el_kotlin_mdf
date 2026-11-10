@@ -108,24 +108,28 @@ and a `CAN_RemoteFrame` group, with float64 seconds as the master. The log reads
 
 ```kotlin
 val writer = Mdf4BusLogWriter.begin(sink, Mdf4BusLogOptions(startNs = nowNs, properties = listOf("device_name" to "el_pm100")))
-writer.addFrame(timeMicros = 1_250, bus = 0, id = 0x316, data = bytes, isExtended = false, isFd = false)
-writer.addRemoteFrame(timeMicros = 1_900, bus = 0, id = 0x7DF, dlc = 8)
+writer.addFrame(timeMicros = 1_250, bus = 1, id = 0x316, data = bytes, isExtended = false, isFd = false)
+writer.addRemoteFrame(timeMicros = 1_900, bus = 1, id = 0x7DF, dlc = 8)
 writer.addEvent(timeMicros = 2_000_000, name = "gap", comment = "no frames for 2 s")
-writer.flush()    // everything added so far is in the file and readable
-writer.finish()   // the events, the final counts, and the identifier MDF
+writer.flush()    // everything added so far, events too, is in the file and readable
+writer.finish()   // the final counts, any events that did not fit, and the identifier MDF
 ```
 
 - **The sink** (`MdfSink`: `position`, `append`, `overwrite`, `flush`) is the caller's, as the reader's `MdfSource` is. The writer
-  appends and goes back only to patch lengths and counts; it holds 64 KiB of records and the events (until `finish`), so a
-  recording of gigabytes is never in memory. `InMemoryMdfSink` is a sink for small files and tests.
+  appends and goes back only to patch lengths and counts; it holds 64 KiB of records, so a recording of gigabytes is never in
+  memory. A writer is for one caller at a time (the caller serializes its calls; a call made while another runs fails fast), and
+  when the sink throws it fails: every later call throws `IllegalStateException`. `InMemoryMdfSink` is a sink for small files and tests.
 - **While it is open** the file is one a unit leaves at a power loss: the identifier is `UnFinMF` and the unfinalized flags say the
   cycle counts, the last data block's length and the payloads' byte count are stale. The reader reads such a file to its last
-  whole record. `flush()` writes the held records and brings the lengths and counts up to date in the file, so a tool that
-  ignores the flags reads it as well; `finish()` does the same, appends the events (EV blocks, linked from the header) and makes
-  the identifier `MDF`.
+  whole record. `flush()` writes the held records and the events added since the last flush (into 64 KiB kept between the head
+  and the data, about 300 events; EV blocks linked from the header) and brings the lengths and counts up to date in the file, so
+  a tool that ignores the flags reads it as well, and a crash loses nothing a flush covered. `finish()` does the same, appends
+  the events that did not fit the 64 KiB after the data (held in memory until then), and makes the identifier `MDF` last.
 - **The head** carries the start time and time class (HD), the `<common_properties>` the caller passes in the header's comment, and
   the tool, vendor and version in the file history.
-- **Frames**: times are microseconds from the start; a frame longer than 8 bytes must be flagged CAN FD and be one of the CAN FD
+- **Frames**: `bus` is the number the file carries, 0 to 255: the Eerie Leap firmware writes its CAN interface + 1, and 0 means
+  the bus is not known (asammdf reads it as any bus). The program id is printable ASCII, cut to eight characters. Times are
+  microseconds from the start; a frame longer than 8 bytes must be flagged CAN FD and be one of the CAN FD
   lengths (12, 16, 20, 24, 32, 48, 64). Events are point events with a name and a comment, of any `MdfEventType` and `MdfEventCause`.
 
 ## Building

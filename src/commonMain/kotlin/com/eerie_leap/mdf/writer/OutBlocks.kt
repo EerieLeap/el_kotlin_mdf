@@ -16,7 +16,8 @@ internal class OutBlock(val type: String, linkCount: Int, val data: ByteArray) {
     var offset = 0L
         internal set
 
-    val length: Long get() = (BLOCK_HEADER_BYTES + LINK_BYTES * links.size + data.size).toLong()
+    // A gap (no type) is room kept in the file, of the size of its data.
+    val length: Long get() = if (type.isEmpty()) data.size.toLong() else (BLOCK_HEADER_BYTES + LINK_BYTES * links.size + data.size).toLong()
 
     /** Where the block's fields begin. */
     val fieldsOffset: Long get() = linkOffset(links.size)
@@ -32,9 +33,15 @@ internal class OutBlockSet(private val start: Long) {
     fun block(type: String, linkCount: Int, data: ByteArray = ByteArray(0)): OutBlock =
         OutBlock(type, linkCount, data).also { blocks.add(it) }
 
+    /** Room of [size] bytes (a multiple of 8) that no block is written in, for blocks written later. */
+    fun gap(size: Int): OutBlock = block("", 0, ByteArray(size))
+
     fun text(text: String): OutBlock = block("TX", 0, LittleEndianBuffer().paddedText(text).toByteArray())
 
     fun xml(text: String): OutBlock = block("MD", 0, LittleEndianBuffer().paddedText(text).toByteArray())
+
+    /** Where the blocks end, on a multiple of 8, as [layOut] would put them. */
+    fun end(): Long = blocks.fold(start) { position, block -> alignedUp(position + block.length) }
 
     /** The bytes of the blocks, the first on [start]; each block's [OutBlock.offset] is set. */
     fun layOut(): ByteArray {
@@ -46,6 +53,10 @@ internal class OutBlockSet(private val start: Long) {
         val out = LittleEndianBuffer(maxOf((position - start).toInt(), 1))
         for (block in blocks) {
             out.zeros((block.offset - start - out.size).toInt())
+            if (block.type.isEmpty()) {
+                out.bytes(block.data)
+                continue
+            }
             out.bytes((BLOCK_MARK + block.type).encodeToByteArray()).zeros(RESERVED_BYTES)
             out.u64(block.length).u64(block.links.size.toLong())
             for (link in block.links) out.u64(link?.offset ?: 0L)
