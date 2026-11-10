@@ -1,8 +1,9 @@
 # el_kotlin_mdf
 
-A reader of ASAM MDF 4 measurement files (`.mf4`) in Kotlin Multiplatform common code, for the Eerie Leap units' logs
-and the Gefera app that plots them. It runs wherever the app does: the JVM (the desktop, and Android, which takes the JVM
-variant) and iOS. It reads; it never writes MDF.
+A reader of ASAM MDF 4 measurement files (`.mf4`), and a writer of MDF 4 CAN bus logs, in Kotlin Multiplatform common code,
+for the Eerie Leap units' logs and the Gefera app that plots them and records CAN traffic. It runs wherever the app does: the
+JVM (the desktop, and Android, which takes the JVM variant) and iOS. It reads any writer's MDF 4; it writes one kind of file,
+a CAN bus log (see Writing).
 
 **Status: it reads any writer's MDF 4 file** that the standard describes, bar what is listed under "What it leaves out"
 (each says so where it is: an `MdfFailure.Unsupported`, a note in `MdfFile.skipped`, or a reason on the thing it leaves
@@ -50,7 +51,7 @@ another logger (see Tests).
 - Values: integers of any bit count to 64 at any bit offset, both byte orders; floats of 16, 32 and 64 bits; strings
   (Latin-1, UTF-8, UTF-16) and byte arrays (for a readout).
 - ASAM bus logging: `CAN_DataFrame` groups as `MdfCanFrame`s, joined to their payloads by offset (or read from the record
-  where the payload is a byte array in it).
+  where the payload is a byte array in it), and `CAN_RemoteFrame` groups as frames with `isRemote` set (no payload).
 - Random access through a source the caller gives (`MdfSource`), so a file of gigabytes is never held in memory: opening a
   file of 200 groups and 20,000 channels takes a fraction of a second, and a scan reads the data of the groups it is asked
   for and no other.
@@ -67,7 +68,7 @@ another logger (see Tests).
 - Zip types other than deflate and transposed deflate, attachments compressed any other way, and attachments that name a
   file instead of holding it.
 - A zipped block of more than 64 MiB (`TooLarge`), a master that leads through more than three masters, and bus events
-  other than CAN data frames (listed by `CanFrames.otherBusEventGroups`, not read).
+  other than CAN data and remote frames (listed by `CanFrames.otherBusEventGroups`, not read).
 
 ## Using it
 
@@ -98,6 +99,35 @@ source at a negative position or of a negative length.
 `Mdf4Reader.open(source, lenient = true)` leaves out what it can't read of a file's structure instead (`MdfFile.issues`) and
 reads the rest.
 
+## Writing
+
+`Mdf4BusLogWriter` (package `com.eerie_leap.mdf.writer`) writes an MDF 4.10 log of CAN bus traffic as the frames come, in the
+layout of the Eerie Leap firmware's logger and the ASAM bus logging standard: a `CAN_DataFrame` group (`BusChannel`, `ID` with
+the IDE flag, `DLC`, `Dir`, `EDL`, `BRS`, `ESI`, `DataLength`, and `DataBytes` as variable-length data in a group of its own)
+and a `CAN_RemoteFrame` group, with float64 seconds as the master. The log reads back through this reader and through asammdf.
+
+```kotlin
+val writer = Mdf4BusLogWriter.begin(sink, Mdf4BusLogOptions(startNs = nowNs, properties = listOf("device_name" to "el_pm100")))
+writer.addFrame(timeMicros = 1_250, bus = 0, id = 0x316, data = bytes, isExtended = false, isFd = false)
+writer.addRemoteFrame(timeMicros = 1_900, bus = 0, id = 0x7DF, dlc = 8)
+writer.addEvent(timeMicros = 2_000_000, name = "gap", comment = "no frames for 2 s")
+writer.flush()    // everything added so far is in the file and readable
+writer.finish()   // the events, the final counts, and the identifier MDF
+```
+
+- **The sink** (`MdfSink`: `position`, `append`, `overwrite`, `flush`) is the caller's, as the reader's `MdfSource` is. The writer
+  appends and goes back only to patch lengths and counts; it holds 64 KiB of records and the events (until `finish`), so a
+  recording of gigabytes is never in memory. `InMemoryMdfSink` is a sink for small files and tests.
+- **While it is open** the file is one a unit leaves at a power loss: the identifier is `UnFinMF` and the unfinalized flags say the
+  cycle counts, the last data block's length and the payloads' byte count are stale. The reader reads such a file to its last
+  whole record. `flush()` writes the held records and brings the lengths and counts up to date in the file, so a tool that
+  ignores the flags reads it as well; `finish()` does the same, appends the events (EV blocks, linked from the header) and makes
+  the identifier `MDF`.
+- **The head** carries the start time and time class (HD), the `<common_properties>` the caller passes in the header's comment, and
+  the tool, vendor and version in the file history.
+- **Frames**: times are microseconds from the start; a frame longer than 8 bytes must be flagged CAN FD and be one of the CAN FD
+  lengths (12, 16, 20, 24, 32, 48, 64). Events are point events with a name and a comment, of any `MdfEventType` and `MdfEventCause`.
+
 ## Building
 
 `./gradlew check` builds the library and runs its tests and code style checks: Kotlin 2.3.10 and JDK 21, which the
@@ -110,7 +140,11 @@ explicitly (Kotlin's explicit API mode).
 
 ## Tests
 
-`commonTest` holds a writer of MDF files (`Mdf4TestWriter`, `ExtraWriters`, `FirmwareLogWriter`) that is independent of
+`Mdf4BusLogWriterTest` writes bus logs and reads them back through the reader, frame for frame (every CAN FD length, extended
+IDs, remote frames, events, the header's properties), cuts an unfinished log at every byte, and streams 100,000 frames through
+the small buffer.
+
+`commonTest` also holds a writer of MDF files (`Mdf4TestWriter`, `ExtraWriters`, `FirmwareLogWriter`) that is independent of
 the reader and writes the firmware's logs in its exact layout: `TestWriterMatchesFirmwareTest` rebuilds twelve of the
 fixtures from what they record and compares the bytes. The reader is tested against it for every block it reads (lists of
 equal and unequal blocks, headers of transposed zipped lists, signal data, arrays, the hierarchy, events, attachments,

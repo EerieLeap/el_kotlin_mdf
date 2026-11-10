@@ -147,7 +147,7 @@ internal class ScanPlanner(
         val plan = byGroup[group]
         val layout = CanFrameLayout.of(group)
         val payloads = layout?.payloads?.let { byGroup[it] }
-        val signal = layout?.let { prepared.signalData[it.payloadChannel] }
+        val signal = layout?.takeUnless { it.isRemote }?.let { prepared.signalData[it.payloadChannel] }
         val timeFailure = plan?.timeFailure
         return when {
             plan == null -> frameFailure(group, "it isn't in this data group")
