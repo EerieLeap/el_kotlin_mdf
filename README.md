@@ -134,7 +134,7 @@ writer.finish()   // the final counts, any events that did not fit, and the iden
 
 ## Building
 
-`./gradlew check` builds the library and runs its tests and code style checks: Kotlin 2.3.10 and JDK 21, which the
+`./gradlew check` builds the library and runs its tests and code style checks: Kotlin 2.4.21 and JDK 21, which the
 toolchain resolver fetches where it's missing. The iOS targets compile to klibs on any host (`compileKotlinIosArm64`,
 `compileKotlinIosSimulatorArm64`); linking and running their tests takes macOS. CI (`.github/workflows/check.yml`) checks the
 formatting (`spotlessCheck`), lints (`detektAll`) and runs the tests (`allTests`) on every push and pull request.

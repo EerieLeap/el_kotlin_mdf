@@ -1,6 +1,6 @@
 [versions]
 # The Gefera app's versions, which an included build must keep: one Kotlin Gradle plugin for both builds.
-kotlin = "2.3.10"
+kotlin = "2.4.21"
 # Code style: Spotless runs ktlint (the formatter); detekt is the linter.
 spotless = "8.10.4"
 ktlint = "1.8.0"
