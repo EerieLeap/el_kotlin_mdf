@@ -136,11 +136,12 @@ writer.finish()   // the final counts, any events that did not fit, and the iden
 
 `./gradlew check` builds the library and runs its tests and code style checks: Kotlin 2.3.10 and JDK 21, which the
 toolchain resolver fetches where it's missing. The iOS targets compile to klibs on any host (`compileKotlinIosArm64`,
-`compileKotlinIosSimulatorArm64`); linking and running their tests takes macOS.
+`compileKotlinIosSimulatorArm64`); linking and running their tests takes macOS. CI (`.github/workflows/check.yml`) checks the
+formatting (`spotlessCheck`), lints (`detektAll`) and runs the tests (`allTests`) on every push and pull request.
 
 The code style is the Gefera app's: ktlint formats (`.editorconfig`, through Spotless) and detekt lints
-(`config/detekt/detekt.yml`); every compilation formats the sources and lints them first. The public API is declared
-explicitly (Kotlin's explicit API mode).
+(`config/detekt/detekt.yml`); every compilation formats the sources and lints them first, unless another build includes this
+one. The public API is declared explicitly (Kotlin's explicit API mode).
 
 ## Tests
 
@@ -177,7 +178,8 @@ also writes the first frames asammdf reads) and the test runs from then on; with
 ## In Gefera
 
 A git submodule at `el_kotlin_mdf/`, which the app's build includes as a composite build, its coordinates
-`com.eerie_leap:el_kotlin_mdf`. The Kotlin version follows the app's: both builds load one Kotlin Gradle plugin.
+`com.eerie_leap:el_kotlin_mdf`. The Kotlin version follows the app's: both builds load one Kotlin Gradle plugin. The app's
+build only compiles the library: its formatting, lint and tests are checked here.
 
 ## License
 

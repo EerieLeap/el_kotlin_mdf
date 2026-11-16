@@ -31,9 +31,11 @@ kotlin {
 // Code style, as the Gefera app has it: Spotless formats the sources and build scripts with ktlint, as .editorconfig
 // sets it, and detekt lints the sources, as config/detekt/detekt.yml sets it. Every Kotlin compilation first formats
 // the sources (on CI it only checks them) and lints them without type resolution; `check` adds detekt's analyses with
-// type resolution, which `detektAll` runs alone.
+// type resolution, which `detektAll` runs alone. A build that includes this one (the Gefera app's) only compiles it:
+// the checks are this repository's own, run by its CI.
 val onCi = providers.environmentVariable("CI").isPresent
 val format = if (onCi) "spotlessCheck" else "spotlessApply"
+val isIncluded = gradle.parent != null
 
 spotless {
     // What .gitattributes checks out.
@@ -62,9 +64,11 @@ tasks.withType<Detekt>().configureEach {
 
 // Without type resolution: one analysis per source set.
 val sourceLint = tasks.withType<Detekt>().matching { it.name.endsWith("SourceSet") }
-tasks.withType<KotlinCompilationTask<*>>().configureEach {
-    dependsOn(format)
-    dependsOn(sourceLint)
+if (!isIncluded) {
+    tasks.withType<KotlinCompilationTask<*>>().configureEach {
+        dependsOn(format)
+        dependsOn(sourceLint)
+    }
 }
 
 val detektAll =
