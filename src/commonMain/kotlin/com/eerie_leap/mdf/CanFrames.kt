@@ -3,10 +3,11 @@ package com.eerie_leap.mdf
 private const val CAN_ID_MASK = 0x1FFFFFFFL
 private const val IDE_BIT_OF_ID = 31
 private const val CAN_DATA_FRAME = "CAN_DataFrame"
+private const val CAN_REMOTE_FRAME = "CAN_RemoteFrame"
 
 /**
- * A CAN frame of a `CAN_DataFrame` bus event group (the ASAM bus logging layout): when, on which bus, its ID and flags, and its
- * payload.
+ * A CAN frame of a `CAN_DataFrame` or `CAN_RemoteFrame` bus event group (the ASAM bus logging layout): when, on which bus, its ID
+ * and flags, and its payload (none for a remote frame).
  */
 @Suppress("LongParameterList") // A frame's fields; the model holds each of them.
 public class MdfCanFrame(
@@ -27,11 +28,14 @@ public class MdfCanFrame(
     public val hasErrorState: Boolean,
     public val dataLength: Int,
     public val data: ByteArray,
+    /** A remote frame (`CAN_RemoteFrame`): a request for the data of [id]; it has no payload, and [dlc] is the length asked for. */
+    public val isRemote: Boolean = false,
 ) {
     override fun equals(other: Any?): Boolean =
         other is MdfCanFrame && time == other.time && bus == other.bus && id == other.id && isExtended == other.isExtended &&
             dlc == other.dlc && isTransmit == other.isTransmit && isFd == other.isFd && isBitRateSwitch == other.isBitRateSwitch &&
-            hasErrorState == other.hasErrorState && dataLength == other.dataLength && data.contentEquals(other.data)
+            hasErrorState == other.hasErrorState && dataLength == other.dataLength && isRemote == other.isRemote &&
+            data.contentEquals(other.data)
 
     override fun hashCode(): Int = (time.hashCode() * HASH_MULTIPLIER + id.hashCode()) * HASH_MULTIPLIER + data.contentHashCode()
 
@@ -51,21 +55,28 @@ public class MdfCanFrame(
 internal class CanFrameLayout private constructor(
     /** The variable-length group the payloads are in; null where they are in signal data blocks or in the record. */
     val payloads: MdfChannelGroup?,
-    /** The `DataBytes` channel. */
-    val payloadChannel: MdfChannel,
+    /** The `DataBytes` channel; none for a remote frame, which has no payload. */
+    private val payloadMember: MdfChannel?,
     private val identifier: NumberField,
     /** The offset to the payload in the variable-length data; unused for a payload in the record. */
     val dataBytes: NumberField,
     private val optional: Map<String, NumberField>,
     private val inline: Boolean,
 ) {
-    /** The payload is bytes in the record, not in variable-length data. */
+    /** The group holds remote frames (`CAN_RemoteFrame`), which have no payload. */
+    val isRemote: Boolean get() = payloadMember == null
+
+    /** The `DataBytes` channel of a layout whose payload is variable-length data. */
+    val payloadChannel: MdfChannel get() = checkNotNull(payloadMember) { "a remote frame has no payload channel" }
+
+    /** The payload is bytes in the record, not in variable-length data (a remote frame's, none at all, included). */
     val hasInlinePayload: Boolean get() = inline
 
     /** The payload bytes of the record whose data begins at [at] in [record], for a layout that [hasInlinePayload]. */
     fun inlinePayload(record: ByteArray, at: Int): ByteArray {
-        val start = at + payloadChannel.byteOffset
-        return record.copyOfRange(start, start + payloadChannel.byteSpan.toInt())
+        val member = payloadMember ?: return ByteArray(0)
+        val start = at + member.byteOffset
+        return record.copyOfRange(start, start + member.byteSpan.toInt())
     }
 
     /** The frame whose fields are in the record data that begins at [at] in [record], with [payload] as its data. */
@@ -74,7 +85,7 @@ internal class CanFrameLayout private constructor(
         val extension = optional["IDE"]
         val isExtended = if (extension != null) extension.readBits(record, at) != 0L else ((rawId ushr IDE_BIT_OF_ID) and 1L) != 0L
         val length = optional["DataLength"]?.readBits(record, at)?.toInt()
-        val data = if (length != null && length in 0 until payload.size) payload.copyOf(length) else payload
+        val data = if (!isRemote && length != null && length in 0 until payload.size) payload.copyOf(length) else payload
         return MdfCanFrame(
             time = time,
             bus = optional["BusChannel"]?.readBits(record, at)?.toInt() ?: 0,
@@ -87,6 +98,7 @@ internal class CanFrameLayout private constructor(
             hasErrorState = flag("ESI", record, at),
             dataLength = data.size,
             data = data,
+            isRemote = isRemote,
         )
     }
 
@@ -99,18 +111,30 @@ internal class CanFrameLayout private constructor(
         private fun membersFit(group: MdfChannelGroup, members: Collection<MdfChannel>): Boolean =
             members.all { it.byteOffset.toLong() + it.byteSpan <= group.dataBytes }
 
-        /** The layout of a `CAN_DataFrame` group, null where [group] isn't one a frame can be read from. */
+        private fun isReadableBusGroup(group: MdfChannelGroup, members: Collection<MdfChannel>): Boolean =
+            group.isBusEvent && membersFit(group, members)
+
+        private fun isNamed(channel: MdfChannel, name: String): Boolean = channel.name == name || channel.name.endsWith(".$name")
+
+        /** The layout of a `CAN_DataFrame` or `CAN_RemoteFrame` group, null where [group] isn't one a frame can be read from. */
         fun of(group: MdfChannelGroup): CanFrameLayout? {
-            val frame = group.channels.firstOrNull { it.name == CAN_DATA_FRAME || it.name.endsWith(".$CAN_DATA_FRAME") }
+            val frame = group.channels.firstOrNull { isNamed(it, CAN_DATA_FRAME) || isNamed(it, CAN_REMOTE_FRAME) }
             val members = frame?.members.orEmpty().associateBy { it.name.substringAfterLast('.') }
-            if (!group.isBusEvent || !membersFit(group, members.values)) return null
             val identifier = members["ID"]?.let { NumberField.of(it) }
-            val payload = members["DataBytes"]
-            if (identifier == null || payload == null) return null
+            if (frame == null || identifier == null || !isReadableBusGroup(group, members.values)) return null
+            val optional = OPTIONAL_MEMBERS.mapNotNull { name -> members[name]?.let { NumberField.of(it) }?.let { name to it } }.toMap()
+            return if (isNamed(frame, CAN_REMOTE_FRAME)) {
+                CanFrameLayout(null, null, identifier, NumberField.offsetOf(frame), optional, inline = true)
+            } else {
+                dataFrame(members["DataBytes"], identifier, optional)
+            }
+        }
+
+        private fun dataFrame(payload: MdfChannel?, identifier: NumberField, optional: Map<String, NumberField>): CanFrameLayout? {
+            if (payload == null) return null
             val inline = payload.kind == MdfChannelKind.Fixed && payload.dataType == MdfDataType.ByteArray && payload.signalDataLink == 0L
             val variable = payload.signalDataGroup != null || payload.signalDataLink != 0L
             if (!inline && !variable) return null
-            val optional = OPTIONAL_MEMBERS.mapNotNull { name -> members[name]?.let { NumberField.of(it) }?.let { name to it } }.toMap()
             return CanFrameLayout(payload.signalDataGroup, payload, identifier, NumberField.offsetOf(payload), optional, inline)
         }
     }
@@ -118,16 +142,19 @@ internal class CanFrameLayout private constructor(
 
 /** What there is of the CAN bus logging in a file. */
 public object CanFrames {
-    /** Whether [group] holds CAN frames in the layout of the bus logging standard (`CAN_DataFrame`), which [MdfScanner] reads. */
+    /**
+     * Whether [group] holds CAN frames in the layout of the bus logging standard (`CAN_DataFrame`, or `CAN_RemoteFrame`), which
+     * [MdfScanner] reads.
+     */
     public fun isCanDataFrameGroup(group: MdfChannelGroup): Boolean = CanFrameLayout.of(group) != null
 
-    /** The bus event groups of [file] other than CAN data frames (remote and error frames, LIN, FlexRay, Ethernet): listed, not read. */
+    /** The bus event groups of [file] other than CAN data and remote frames (error frames, LIN, FlexRay, Ethernet): listed, not read. */
     public fun otherBusEventGroups(file: MdfFile): List<MdfChannelGroup> =
         file.channelGroups.filter { it.isBusEvent && !it.isVlsd && !isCanDataFrameGroup(it) }
 
     /**
-     * Reads the frames of [frameGroup] (a CAN data frame group of [dataGroup] of [file]) that the file holds now, handing each to
-     * [onFrame]. A payload that no frame names is ignored. Returns how far the scan got; for a file still arriving use an
+     * Reads the frames of [frameGroup] (a CAN data or remote frame group of [dataGroup] of [file]) that the file holds now, handing
+     * each to [onFrame]. A payload that no frame names is ignored. Returns how far the scan got; for a file still arriving use an
      * [MdfScanner] and call it again as it grows.
      */
     public suspend fun read(
